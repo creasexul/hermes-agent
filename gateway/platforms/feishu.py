@@ -3237,6 +3237,13 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         reply_in_thread = bool((metadata or {}).get("thread_id"))
+        # When posting inside a Feishu thread (topic group), we must use the
+        # reply API.  If no explicit reply_to was provided but a thread_id is
+        # present in metadata, fall back to replying to the thread root message
+        # so the message stays inside the thread instead of landing in the
+        # chat root.
+        if not reply_to and reply_in_thread:
+            reply_to = (metadata or {}).get("thread_id")
         if reply_to:
             body = self._build_reply_message_body(
                 content=payload,

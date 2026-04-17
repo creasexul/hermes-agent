@@ -295,6 +295,18 @@ def build_anthropic_client(api_key: str, base_url: str = None):
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
+    # Merge extra_headers from config.yaml model.extra_headers into default_headers.
+    # This allows users to inject custom headers (e.g. X-Sub-Module) required by
+    # third-party proxies.
+    try:
+        from hermes_cli.config import load_config
+        cfg_extra = (load_config().get("model") or {}).get("extra_headers")
+        if isinstance(cfg_extra, dict) and cfg_extra:
+            existing = kwargs.get("default_headers") or {}
+            kwargs["default_headers"] = {**existing, **cfg_extra}
+    except Exception:
+        pass
+
     return _anthropic_sdk.Anthropic(**kwargs)
 
 

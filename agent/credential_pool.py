@@ -776,10 +776,17 @@ class CredentialPool:
         When *clear_expired* is True, entries whose cooldown has elapsed are
         reset to STATUS_OK and persisted.  When *refresh* is True, entries
         that need a token refresh are refreshed (skipped on failure).
+
+        Never returns an empty list when the pool has entries — if all entries
+        are in exhaustion cooldown, they are force-cleared so a real request
+        can determine whether the credential is actually invalid.  This
+        prevents a single transient 401/429 from making the entire pool
+        unavailable for the cooldown duration.
         """
         now = time.time()
         cleared_any = False
         available: List[PooledCredential] = []
+        still_cooling: List[PooledCredential] = []
         for entry in self._entries:
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed
@@ -803,6 +810,7 @@ class CredentialPool:
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry)
                 if exhausted_until is not None and now < exhausted_until:
+                    still_cooling.append(entry)
                     continue
                 if clear_expired:
                     cleared = replace(
@@ -823,6 +831,30 @@ class CredentialPool:
                     continue
                 entry = refreshed
             available.append(entry)
+
+        # If ALL entries are in cooldown, force-clear them so the real request
+        # determines validity.  Exhaustion is a heuristic — the network is the
+        # source of truth.
+        if not available and still_cooling:
+            logger.info(
+                "credential pool: all %d entries exhausted — force-clearing "
+                "cooldowns to let real requests decide validity",
+                len(still_cooling),
+            )
+            for entry in still_cooling:
+                cleared = replace(
+                    entry,
+                    last_status=STATUS_OK,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                )
+                self._replace_entry(entry, cleared)
+                available.append(cleared)
+            cleared_any = True
+
         if cleared_any:
             self._persist()
         return available

@@ -4648,7 +4648,13 @@ class AIAgent:
 
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
-        runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+        # Prefer runtime_base_url (explicit override) > current agent base_url
+        # (user-configured proxy) > pool entry base_url (auto-detected default).
+        # This prevents credential pool entries with default base_url
+        # (e.g. https://api.anthropic.com) from overriding a user-configured
+        # proxy (e.g. a corporate gateway) that the agent was initialized with.
+        entry_runtime_base = getattr(entry, "runtime_base_url", None)
+        runtime_base = entry_runtime_base or self.base_url or getattr(entry, "base_url", None) or ""
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
@@ -6948,6 +6954,17 @@ class AIAgent:
                 max_iterations=function_args.get("max_iterations"),
                 parent_agent=self,
             )
+        elif function_name == "workflow":
+            from tools.workflow_tool import workflow_run_tool as _workflow_run_tool
+            return _workflow_run_tool(
+                workflow=function_args.get("workflow"),
+                arguments=function_args.get("arguments"),
+                action=function_args.get("action", "run"),
+                run_id=function_args.get("run_id"),
+                template_name=function_args.get("template_name"),
+                parent_agent=self,
+                task_id=effective_task_id,
+            )
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -7335,6 +7352,35 @@ class AIAgent:
                     self._delegate_spinner = None
                     tool_duration = time.time() - tool_start_time
                     cute_msg = _get_cute_tool_message_impl('delegate_task', function_args, tool_duration, result=_delegate_result)
+                    if spinner:
+                        spinner.stop(cute_msg)
+                    elif self._should_emit_quiet_tool_messages():
+                        self._vprint(f"  {cute_msg}")
+            elif function_name == "workflow":
+                from tools.workflow_tool import workflow_run_tool as _workflow_run_tool
+                action = function_args.get("action", "run")
+                wf_preview = (function_args.get("workflow") or "")[:40].split("\n")[0]
+                spinner_label = f"🔄 workflow:{action} {wf_preview}" if wf_preview else f"🔄 workflow:{action}"
+                spinner = None
+                if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
+                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
+                    spinner.start()
+                _wf_result = None
+                try:
+                    function_result = _workflow_run_tool(
+                        workflow=function_args.get("workflow"),
+                        arguments=function_args.get("arguments"),
+                        action=action,
+                        run_id=function_args.get("run_id"),
+                        template_name=function_args.get("template_name"),
+                        parent_agent=self,
+                        task_id=effective_task_id,
+                    )
+                    _wf_result = function_result
+                finally:
+                    tool_duration = time.time() - tool_start_time
+                    cute_msg = _get_cute_tool_message_impl('workflow', function_args, tool_duration, result=_wf_result)
                     if spinner:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
