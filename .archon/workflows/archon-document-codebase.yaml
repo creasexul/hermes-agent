@@ -1,0 +1,218 @@
+name: archon-document-codebase
+description: |
+  Use when: 项目文档不完善，需要系统性补全，使 AI Agent 能通过渐进式引用文档精准索引到任意代码
+  Input: 项目根路径（可选，默认当前目录）
+  Output: 
+    - docs/modules/*.md — 每个核心模块的深度文档
+    - docs/architecture.md — 架构总览 + 数据流图
+    - docs/navigation.md — 渐进式索引导航（"我要找 X，去看 Y 文档的 Z 节"）
+    - AGENTS.md — 更新：加入文档层级引用
+  NOT for: 第一次从零建项目文档（用 archon-assist 先建骨架）
+  
+  Best Practice: 本 workflow 是「项目文档化」的可复用模板
+    1. 扫描现状 → 2. 找 gap → 3. 并行生成模块文档 → 4. 建导航层 → 5. 验证可索引性
+
+provider: claude
+
+nodes:
+  # ── Phase 1: 扫描现状 ──────────────────────────────────────────────
+  - id: scan-structure
+    bash: |
+      PROJECT_DIR="${ARGUMENTS:-$(pwd)}"
+      echo "PROJECT_DIR=$PROJECT_DIR"
+      
+      # 目录树（2层，排除噪音）
+      echo "=== DIRECTORY TREE ===" 
+      find "$PROJECT_DIR" -maxdepth 2 \
+        -not -path "*/__pycache__/*" \
+        -not -path "*/.git/*" \
+        -not -path "*/node_modules/*" \
+        -not -path "*/.venv/*" \
+        -not -path "*/venv/*" \
+        -not -path "*/.pytest_cache/*" \
+        -not -name "*.pyc" \
+        | sort | head -200
+      
+      # 现有文档清单
+      echo ""
+      echo "=== EXISTING DOCS ==="
+      find "$PROJECT_DIR" -name "*.md" \
+        -not -path "*/.git/*" \
+        -not -path "*/optional-skills/*" \
+        -not -path "*/node_modules/*" \
+        | sort
+      
+      # Python/TS 模块清单（顶层）
+      echo ""
+      echo "=== CORE MODULES ==="
+      find "$PROJECT_DIR" -maxdepth 2 \
+        \( -name "*.py" -o -name "*.ts" \) \
+        -not -path "*/__pycache__/*" \
+        -not -path "*/.git/*" \
+        -not -path "*/node_modules/*" \
+        -not -path "*/.venv/*" \
+        -not -name "test_*.py" \
+        -not -name "*_test.py" \
+        | sort | head -150
+      
+      # 已有 AGENTS.md 内容
+      echo ""
+      echo "=== AGENTS.md (if exists) ==="
+      if [ -f "$PROJECT_DIR/AGENTS.md" ]; then
+        wc -l "$PROJECT_DIR/AGENTS.md"
+        head -80 "$PROJECT_DIR/AGENTS.md"
+      else
+        echo "NO AGENTS.md"
+      fi
+    timeout: 30000
+
+  # ── Phase 2: 分析 gap ──────────────────────────────────────────────
+  - id: analyze-gaps
+    prompt: |
+      你是代码库文档化专家。分析以下项目扫描结果，找出文档覆盖的空白。
+      
+      扫描结果：
+      $scan-structure.output
+      
+      任务：输出结构化 JSON，格式如下：
+      {
+        "project_name": "项目名",
+        "project_dir": "路径",
+        "total_modules": N,
+        "documented_modules": ["已有文档的模块"],
+        "gap_modules": [
+          {
+            "module": "模块名（如 tools/, agent/, gateway/）",
+            "path": "相对路径",
+            "priority": "critical|high|medium",
+            "reason": "为什么重要/缺什么",
+            "key_files": ["最重要的几个文件"],
+            "estimated_lines": N
+          }
+        ],
+        "architecture_documented": true/false,
+        "navigation_documented": true/false,
+        "agents_md_quality": "none|poor|partial|good",
+        "recommendation": "整体建议"
+      }
+      
+      优先级判断标准：
+      - critical: AI Agent 无法理解核心数据流/入口点的模块
+      - high: 重要子系统，现有 AGENTS.md 中提到但无详细文档
+      - medium: 辅助模块，有文件名能推断用途
+      
+      只输出 JSON，不要其他内容。
+    depends_on: [scan-structure]
+    output_format:
+      type: object
+      properties:
+        project_name:
+          type: string
+        gap_modules:
+          type: array
+        agents_md_quality:
+          type: string
+        architecture_documented:
+          type: boolean
+    model: claude-sonnet-4-5
+
+  # ── Phase 3: 深度读取关键模块源码 ──────────────────────────────────
+  - id: read-critical-modules
+    bash: |
+      # 读取 gap_modules 中 critical/high 的模块源码摘要
+      # 使用 Python 解析上游 JSON
+      python3 - << 'PYEOF'
+      import json, subprocess, os, sys
+      
+      raw = '''$analyze-gaps.output'''
+      
+      try:
+          data = json.loads(raw)
+      except:
+          print("JSON parse failed, raw output:")
+          print(raw[:500])
+          sys.exit(0)
+      
+      gaps = data.get("gap_modules", [])
+      critical = [g for g in gaps if g.get("priority") in ("critical", "high")]
+      
+      print(f"Found {len(critical)} critical/high modules to deep-read\n")
+      
+      project_dir = data.get("project_dir", ".")
+      if not project_dir or project_dir == ".":
+          import subprocess
+          project_dir = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+      
+      for mod in critical[:6]:  # 最多读6个模块
+          mod_path = os.path.join(project_dir, mod.get("path", ""))
+          print(f"\n{'='*60}")
+          print(f"MODULE: {mod['module']} ({mod.get('priority')})")
+          print(f"PATH: {mod_path}")
+          print(f"REASON: {mod.get('reason', '')}")
+          print(f"KEY FILES: {mod.get('key_files', [])}")
+          print("="*60)
+          
+          # 读每个关键文件的前80行
+          for f in mod.get("key_files", [])[:3]:
+              fpath = os.path.join(project_dir, f)
+              if os.path.exists(fpath):
+                  print(f"\n--- {f} (first 80 lines) ---")
+                  with open(fpath) as fp:
+                      lines = fp.readlines()[:80]
+                      print("".join(lines))
+              else:
+                  print(f"NOT FOUND: {fpath}")
+      PYEOF
+    depends_on: [analyze-gaps]
+    timeout: 30000
+
+  # ── Phase 4: 生成架构总览文档 ──────────────────────────────────────
+  - id: generate-architecture-doc
+    command: archon-generate-architecture-doc
+    depends_on: [read-critical-modules]
+    context: fresh
+
+  # ── Phase 5: 并行生成各模块文档 ────────────────────────────────────
+  # 注：Archon 的并行是通过相同 depends_on 自动实现的
+  # 这里生成前3个高优先级模块（实际项目可按 gap 数量扩展）
+  
+  - id: generate-module-doc-1
+    command: archon-generate-module-doc
+    depends_on: [read-critical-modules]
+    context: fresh
+    # 通过 ARTIFACTS_DIR 传递 module index
+    bash_pre: |
+      echo "1" > $ARTIFACTS_DIR/module_index_1.txt
+
+  - id: generate-module-doc-2
+    command: archon-generate-module-doc
+    depends_on: [read-critical-modules]
+    context: fresh
+    bash_pre: |
+      echo "2" > $ARTIFACTS_DIR/module_index_2.txt
+
+  - id: generate-module-doc-3
+    command: archon-generate-module-doc
+    depends_on: [read-critical-modules]
+    context: fresh
+    bash_pre: |
+      echo "3" > $ARTIFACTS_DIR/module_index_3.txt
+
+  # ── Phase 6: 生成导航层（汇聚后）──────────────────────────────────
+  - id: generate-navigation
+    command: archon-generate-navigation
+    depends_on: [generate-architecture-doc, generate-module-doc-1, generate-module-doc-2, generate-module-doc-3]
+    trigger_rule: one_success
+    context: fresh
+
+  # ── Phase 7: 更新 AGENTS.md ────────────────────────────────────────
+  - id: update-agents-md
+    command: archon-update-agents-md
+    depends_on: [generate-navigation]
+    context: fresh
+
+  # ── Phase 8: 验证可索引性 ──────────────────────────────────────────
+  - id: verify-indexability
+    command: archon-verify-indexability
+    depends_on: [update-agents-md]
+    context: fresh

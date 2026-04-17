@@ -1,0 +1,151 @@
+name: archon-build-index
+description: |
+  Use when: 为项目建立高质量的渐进式文档索引体系
+  Input: 项目根路径（可选，默认当前目录）
+  Output: 项目各层级的 AGENTS.md 索引文件，满足以下标准：
+    - 每个 AGENTS.md 只做索引，不堆内容
+    - 拆分标准：当前层索引低效 OR 存在多个大型高内聚子模块
+    - 叶子层精确到文件/类，包含业务流程和调用栈描述
+    - Claude Code 3次 Read 以内定位任意代码
+
+  NOT for: 生成 API 文档、测试文档、用户手册
+
+provider: claude
+
+nodes:
+  # ── Phase 1: 快速盘点项目骨架 ─────────────────────────────────────
+  - id: scan-skeleton
+    bash: |
+      PROJECT_DIR="${ARGUMENTS:-$(pwd)}"
+      OUT="$ARTIFACTS_DIR/scan-skeleton.txt"
+
+      {
+        echo "PROJECT_DIR=$PROJECT_DIR"
+        echo ""
+
+        echo "=== 顶层结构 ==="
+        find "$PROJECT_DIR" -maxdepth 1 \
+          -not -path "*/.git" \
+          -not -name ".*" \
+          | sort | while read f; do
+            if [ -d "$f" ]; then
+              count=$(find "$f" \( -name "*.py" -o -name "*.ts" -o -name "*.kt" -o -name "*.java" -o -name "*.go" -o -name "*.rs" \) 2>/dev/null | grep -cv "build\|__pycache__\|node_modules\|\.venv\|venv") || count=0
+              echo "$(basename $f)/  [${count} src files]"
+            else
+              echo "$(basename $f)"
+            fi
+          done
+
+        echo ""
+        echo "=== 现有 AGENTS.md 清单 ==="
+        find "$PROJECT_DIR" -name "AGENTS.md" \
+          -not -path "*/.git/*" \
+          -not -path "*/build/*" \
+          -not -path "*/node_modules/*" \
+          | sort
+
+        echo ""
+        echo "=== 现有 AGENTS.md 内容摘要 ==="
+        find "$PROJECT_DIR" -name "AGENTS.md" \
+          -not -path "*/.git/*" \
+          -not -path "*/build/*" \
+          | sort | while read f; do
+            echo "--- $f ($(wc -l < "$f") lines) ---"
+            head -5 "$f"
+            echo ""
+          done
+
+        echo ""
+        echo "=== 主要源码文件语言分布 ==="
+        for ext in py ts kt java go rs tsx jsx; do
+          count=$(find "$PROJECT_DIR" -name "*.$ext" \
+            -not -path "*/build/*" \
+            -not -path "*/__pycache__/*" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.venv/*" \
+            -not -path "*/venv/*" \
+            -not -path "*/test*" \
+            2>/dev/null | wc -l | tr -d ' ')
+          if [ "$count" -gt 0 ] 2>/dev/null; then
+            echo ".$ext: $count files"
+          fi
+        done
+      } | tee "$OUT"
+
+      echo ""
+      echo "Scan saved to: $OUT"
+      exit 0
+    timeout: 30000
+
+  # ── Phase 2: 深度分析项目，规划索引层级 ───────────────────────────
+  - id: plan-index-structure
+    command: archon-analyze-and-plan
+    depends_on: [scan-skeleton]
+    context: fresh
+
+  # ── Phase 3: 并行深探各大模块 ─────────────────────────────────────
+  # 每个节点探索一个高内聚大模块，写出该模块的 AGENTS.md
+  - id: explore-module-1
+    command: archon-explore-module
+    depends_on: [plan-index-structure]
+    context: fresh
+    bash_pre: |
+      echo "1" > $ARTIFACTS_DIR/module_slot.txt
+
+  - id: explore-module-2
+    command: archon-explore-module
+    depends_on: [plan-index-structure]
+    context: fresh
+    bash_pre: |
+      echo "2" > $ARTIFACTS_DIR/module_slot.txt
+
+  - id: explore-module-3
+    command: archon-explore-module
+    depends_on: [plan-index-structure]
+    context: fresh
+    bash_pre: |
+      echo "3" > $ARTIFACTS_DIR/module_slot.txt
+
+  - id: explore-module-4
+    command: archon-explore-module
+    depends_on: [plan-index-structure]
+    context: fresh
+    bash_pre: |
+      echo "4" > $ARTIFACTS_DIR/module_slot.txt
+
+  # ── Phase 4: 写根 AGENTS.md ────────────────────────────────────────
+  - id: write-root-agents-md
+    command: archon-write-root-agents-md
+    depends_on: [explore-module-1, explore-module-2, explore-module-3, explore-module-4]
+    trigger_rule: one_success
+    context: fresh
+
+  # ── Phase 5: Review 可索引性 ───────────────────────────────────────
+  - id: review-indexability
+    command: archon-review-indexability
+    depends_on: [write-root-agents-md]
+    context: fresh
+
+  # ── Phase 6: 按 review 结果补漏 ───────────────────────────────────
+  - id: patch-gaps
+    loop:
+      prompt: |
+        读取 $ARTIFACTS_DIR/review-indexability-result.json，检查 gaps 字段。
+
+        如果 gaps 为空数组，或 score >= 8，输出 <promise>DONE</promise>，结束。
+
+        否则，针对每个 gap：
+        1. 读取对应模块的现有 AGENTS.md（如果有）
+        2. 深度读取该模块的代码（关注 gap 描述的缺失维度）
+        3. 补写或修改对应的 AGENTS.md
+
+        修补完成后，重新运行可索引性验证：
+        - 对 gaps 中的每个意图，验证现在能否在 ≤3 次 Read 内定位到代码
+        - 更新 $ARTIFACTS_DIR/review-indexability-result.json
+
+        如果所有 gaps 已修复或 score >= 8，输出 <promise>DONE</promise>。
+      until: DONE
+      max_iterations: 3
+      fresh_context: false
+    depends_on: [review-indexability]
+    idle_timeout: 600000

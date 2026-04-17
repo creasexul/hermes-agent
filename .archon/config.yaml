@@ -1,0 +1,5 @@
+worktree:
+  baseBranch: main
+
+docs:
+  path: docs
