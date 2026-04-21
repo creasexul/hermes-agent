@@ -1,0 +1,169 @@
+name: archon-index-codebase
+description: |
+  Use when: 为任意项目建立渐进式、可重复执行的业务上下文索引体系
+  Input: 项目根路径（可选，默认当前目录）
+  Output: 项目各层级 AGENTS.md 索引文件
+    - 每个 AGENTS.md ≤ 400 行
+    - 可重复执行：已有索引按需更新，未覆盖的递归深入
+    - 停止条件：目录源码 ≤ 2000 行 OR 无高内聚子业务
+  NOT for: 生成 API 文档、测试文档、用户手册
+
+provider: claude
+
+nodes:
+  # ── Phase 1: bash 完整统计所有模块数据，AI 不参与 ─────────────────
+  - id: scan-all
+    bash: |
+      PROJECT_DIR="${ARGUMENTS:-$(pwd)}"
+      PROJECT_DIR=$(cd "$PROJECT_DIR" && pwd)
+      OUT="$ARTIFACTS_DIR/module-stats.json"
+
+      echo "Scanning $PROJECT_DIR ..."
+
+      # 统计指定目录的源码行数（仅当前层，不递归）
+      count_lines() {
+        local dir=$1
+        find "$dir" -maxdepth 1 \( \
+          -name "*.py" -o -name "*.ts" -o -name "*.tsx" \
+          -o -name "*.kt" -o -name "*.java" -o -name "*.go" \
+          -o -name "*.rs" -o -name "*.swift" -o -name "*.jsx" \
+        \) 2>/dev/null | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}'
+      }
+
+      # 统计指定目录（含所有子目录）的源码总行数
+      count_lines_recursive() {
+        local dir=$1
+        find "$dir" \( \
+          -name "*.py" -o -name "*.ts" -o -name "*.tsx" \
+          -o -name "*.kt" -o -name "*.java" -o -name "*.go" \
+          -o -name "*.rs" -o -name "*.swift" -o -name "*.jsx" \
+        \) \
+          -not -path "*/build/*" -not -path "*/__pycache__/*" \
+          -not -path "*/node_modules/*" -not -path "*/.gradle/*" \
+          -not -path "*/dist/*" -not -path "*/.next/*" \
+          2>/dev/null | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}'
+      }
+
+      # 生成顶层模块统计
+      python3 - <<'PYEOF'
+      import os, json, subprocess
+
+      project_dir = os.environ.get('PROJECT_DIR', os.getcwd())
+      artifacts_dir = os.environ.get('ARTIFACTS_DIR', '/tmp')
+      out_file = os.path.join(artifacts_dir, 'module-stats.json')
+
+      src_exts = ('.py','.ts','.tsx','.kt','.java','.go','.rs','.swift','.jsx')
+      skip_dirs = {'build','__pycache__','node_modules','.gradle','dist','.next','.git','.venv','venv'}
+
+      def count_src_lines(path):
+          total = 0
+          for root, dirs, files in os.walk(path):
+              dirs[:] = [d for d in dirs if d not in skip_dirs]
+              for f in files:
+                  if f.endswith(src_exts):
+                      try:
+                          with open(os.path.join(root,f), errors='ignore') as fh:
+                              total += sum(1 for _ in fh)
+                      except:
+                          pass
+          return total
+
+      def get_subdirs(path, max_depth=1):
+          result = []
+          try:
+              for name in sorted(os.listdir(path)):
+                  if name.startswith('.') or name in skip_dirs:
+                      continue
+                  full = os.path.join(path, name)
+                  if os.path.isdir(full):
+                      lines = count_src_lines(full)
+                      result.append({'name': name, 'path': full, 'rel': os.path.relpath(full, project_dir), 'src_lines': lines})
+          except:
+              pass
+          return result
+
+      # 顶层目录
+      top_modules = get_subdirs(project_dir)
+
+      # 现有 AGENTS.md
+      existing_agents = []
+      for root, dirs, files in os.walk(project_dir):
+          dirs[:] = [d for d in dirs if d not in skip_dirs and d != '.git']
+          if 'AGENTS.md' in files:
+              rel = os.path.relpath(os.path.join(root,'AGENTS.md'), project_dir)
+              try:
+                  lines = sum(1 for _ in open(os.path.join(root,'AGENTS.md'), errors='ignore'))
+              except:
+                  lines = 0
+              existing_agents.append({'path': rel, 'lines': lines})
+
+      # 语言分布
+      lang_count = {}
+      for root, dirs, files in os.walk(project_dir):
+          dirs[:] = [d for d in dirs if d not in skip_dirs and d != '.git']
+          for f in files:
+              ext = os.path.splitext(f)[1]
+              if ext in src_exts:
+                  lang_count[ext] = lang_count.get(ext,0) + 1
+
+      # 项目类型线索
+      type_hints = []
+      for marker in ['package.json','build.gradle','build.gradle.kts','Cargo.toml','go.mod',
+                     'pyproject.toml','setup.py','next.config.js','vite.config.ts']:
+          if os.path.exists(os.path.join(project_dir, marker)):
+              type_hints.append(marker)
+
+      result = {
+          'project_dir': project_dir,
+          'top_modules': top_modules,
+          'existing_agents_md': existing_agents,
+          'language_distribution': lang_count,
+          'project_type_hints': type_hints,
+          'total_src_lines': sum(m['src_lines'] for m in top_modules)
+      }
+
+      with open(out_file, 'w') as f:
+          json.dump(result, f, indent=2, ensure_ascii=False)
+
+      print(f"Written: {out_file}")
+      print(f"Top modules: {len(top_modules)}")
+      print(f"Total src lines: {result['total_src_lines']:,}")
+      for m in sorted(top_modules, key=lambda x: -x['src_lines'])[:10]:
+          print(f"  {m['rel']}: {m['src_lines']:,} lines")
+      PYEOF
+
+      exit 0
+    timeout: 120000
+
+  # ── Phase 2: AI 只做决策，数据已经备齐 ───────────────────────────
+  - id: plan-index
+    command: index-plan
+    depends_on: [scan-all]
+    context: fresh
+
+  # ── Phase 3: 每个模块独立 session，串行在 loop 内 ─────────────────
+  # 每次调用 index-module，处理 index-plan.json 中的下一个未完成模块
+  - id: run-modules
+    loop:
+      prompt: |
+        读取 $ARTIFACTS_DIR/index-plan.json，找出所有 status != "done" 的模块。
+
+        如果所有模块都是 done，输出 <promise>DONE</promise>。
+
+        否则取第一个未完成模块，运行：
+        archon workflow run archon-index-module "<module_rel_path>" --no-worktree
+
+        等待完成后，将该模块标记为 done 并更新 index-plan.json，然后继续下一个。
+
+        注意：每次只处理一个模块，处理完再取下一个。
+      until: DONE
+      max_iterations: 60
+      fresh_context: false
+    depends_on: [plan-index]
+    idle_timeout: 1800000
+
+  # ── Phase 4: 写根 AGENTS.md ───────────────────────────────────────
+  - id: write-root-index
+    command: index-write-root
+    depends_on: [run-modules]
+    context: fresh

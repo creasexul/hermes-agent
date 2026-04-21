@@ -1,0 +1,132 @@
+name: archon-index-module
+description: |
+  Use when: 为单个模块生成 AGENTS.md，由 archon-index-codebase 调用
+  Input: 模块相对路径（如 "business/chat"）
+  Output: 该模块的 AGENTS.md（≤ 400 行）
+  NOT for: 直接手动调用
+
+provider: claude
+
+nodes:
+  # ── Step 1: bash 统计该模块的子目录结构 ──────────────────────────
+  - id: scan-module
+    bash: |
+      MODULE_REL="${ARGUMENTS}"
+      PROJECT_DIR=$(cat "$ARTIFACTS_DIR/../../../index-plan.json" 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['project_dir'])" \
+        2>/dev/null || pwd)
+
+      # fallback: 找 index-plan.json
+      PLAN=$(find "$HOME" -name "index-plan.json" -path "*/artifacts/*" \
+        -newer /tmp -maxdepth 10 2>/dev/null | head -1)
+      if [ -n "$PLAN" ]; then
+        PROJECT_DIR=$(python3 -c "import json; print(json.load(open('$PLAN'))['project_dir'])" 2>/dev/null || echo "$PROJECT_DIR")
+      fi
+
+      MODULE_ABS="$PROJECT_DIR/$MODULE_REL"
+      OUT="$ARTIFACTS_DIR/module-scan.json"
+
+      echo "MODULE_REL=$MODULE_REL"
+      echo "MODULE_ABS=$MODULE_ABS"
+      echo "PROJECT_DIR=$PROJECT_DIR"
+
+      python3 - <<PYEOF
+      import os, json
+
+      module_abs = "$MODULE_ABS"
+      module_rel = "$MODULE_REL"
+      project_dir = "$PROJECT_DIR"
+      artifacts_dir = "$ARTIFACTS_DIR"
+
+      src_exts = ('.py','.ts','.tsx','.kt','.java','.go','.rs','.swift','.jsx')
+      skip_dirs = {'build','__pycache__','node_modules','.gradle','dist','.next','.git','.venv','venv'}
+
+      def count_lines(path, recursive=False):
+          total = 0
+          walker = os.walk(path) if recursive else [(path, [], os.listdir(path) if os.path.isdir(path) else [])]
+          for root, dirs, files in walker:
+              if recursive:
+                  dirs[:] = [d for d in dirs if d not in skip_dirs]
+              for f in files:
+                  if f.endswith(src_exts):
+                      try:
+                          with open(os.path.join(root,f), errors='ignore') as fh:
+                              total += sum(1 for _ in fh)
+                      except:
+                          pass
+          return total
+
+      def list_src_files(path, max_depth=1):
+          result = []
+          for root, dirs, files in os.walk(path):
+              dirs[:] = [d for d in dirs if d not in skip_dirs]
+              depth = root[len(path):].count(os.sep)
+              if depth >= max_depth:
+                  dirs.clear()
+              for f in sorted(files):
+                  if f.endswith(src_exts + ('.md',)):
+                      full = os.path.join(root, f)
+                      try:
+                          lines = sum(1 for _ in open(full, errors='ignore'))
+                      except:
+                          lines = 0
+                      result.append({
+                          'rel': os.path.relpath(full, module_abs),
+                          'lines': lines,
+                          'ext': os.path.splitext(f)[1]
+                      })
+          return sorted(result, key=lambda x: -x['lines'])
+
+      # 子目录统计
+      subdirs = []
+      if os.path.isdir(module_abs):
+          for name in sorted(os.listdir(module_abs)):
+              if name.startswith('.') or name in skip_dirs:
+                  continue
+              full = os.path.join(module_abs, name)
+              if os.path.isdir(full):
+                  lines = count_lines(full, recursive=True)
+                  # 找子目录的现有 AGENTS.md
+                  has_agents = os.path.exists(os.path.join(full, 'AGENTS.md'))
+                  subdirs.append({
+                      'name': name,
+                      'rel': os.path.relpath(full, project_dir),
+                      'src_lines': lines,
+                      'has_agents_md': has_agents
+                  })
+
+      # 当前目录的直接源码文件
+      direct_files = list_src_files(module_abs, max_depth=1)
+
+      # 总行数
+      total_lines = count_lines(module_abs, recursive=True)
+
+      result = {
+          'module_rel': module_rel,
+          'module_abs': module_abs,
+          'project_dir': project_dir,
+          'total_src_lines': total_lines,
+          'subdirs': sorted(subdirs, key=lambda x: -x['src_lines']),
+          'direct_files': direct_files[:50],
+          'has_existing_agents_md': os.path.exists(os.path.join(module_abs, 'AGENTS.md'))
+      }
+
+      out = os.path.join(artifacts_dir, 'module-scan.json')
+      with open(out, 'w') as f:
+          json.dump(result, f, indent=2, ensure_ascii=False)
+
+      print(f"Module: {module_rel}")
+      print(f"Total lines: {total_lines:,}")
+      print(f"Subdirs: {len(subdirs)}")
+      for d in subdirs[:10]:
+          print(f"  {d['name']}: {d['src_lines']:,} lines")
+      PYEOF
+
+      exit 0
+    timeout: 60000
+
+  # ── Step 2: AI 只读这一个模块，写 AGENTS.md ──────────────────────
+  - id: write-agents-md
+    command: index-module
+    depends_on: [scan-module]
+    context: fresh
