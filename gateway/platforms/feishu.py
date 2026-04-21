@@ -1188,6 +1188,15 @@ class FeishuAdapter(BasePlatformAdapter):
         # edit_message() so subsequent stream deltas patch the same card
         # instead of editing it as text/post.
         self._card_messages: Dict[str, Dict[str, Any]] = {}
+        # Per-card streaming state: message_id → {"main_text": str, "tool_steps": List[dict]}.
+        # Lets ``_edit_thread_reply_card`` re-emit the card with accumulated
+        # tool steps and lets ``append_tool_step`` patch new steps into the
+        # same card without losing the latest main text.  The lock protects
+        # both this dict and ``_card_messages`` against concurrent updates
+        # from ``progress_callback`` (sync, foreign thread) and the adapter
+        # event loop.
+        self._card_state: Dict[str, Dict[str, Any]] = {}
+        self._card_state_lock = threading.Lock()
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1490,11 +1499,16 @@ class FeishuAdapter(BasePlatformAdapter):
                         # patch the same card or, if the patch fails, fall back
                         # to shipping a fresh card without losing thread/reply
                         # placement.
-                        self._card_messages[result.message_id] = {
-                            "chat_id": chat_id,
-                            "reply_to": reply_to,
-                            "metadata": metadata,
-                        }
+                        with self._card_state_lock:
+                            self._card_messages[result.message_id] = {
+                                "chat_id": chat_id,
+                                "reply_to": reply_to,
+                                "metadata": metadata,
+                            }
+                            self._card_state[result.message_id] = {
+                                "main_text": formatted,
+                                "tool_steps": [],
+                            }
                     return result
                 logger.warning(
                     "[Feishu] Thread-reply card rejected (code=%s msg=%s); "
@@ -1610,8 +1624,22 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Patch an in-place card; on failure, ship a new card to keep streaming alive."""
         formatted = self.format_message(content)
+        # Pull the accumulated tool_steps for this card so streaming edits
+        # don't drop the collapsible "执行记录" panel.  Update main_text
+        # under the lock so concurrent ``append_tool_step`` calls observe
+        # the latest body when they rebuild the card.
+        with self._card_state_lock:
+            state = self._card_state.get(stale_message_id)
+            if state is not None:
+                state["main_text"] = formatted
+                tool_steps = list(state.get("tool_steps") or [])
+            else:
+                tool_steps = []
         try:
-            card = _build_thread_reply_card(main_text=formatted)
+            card = _build_thread_reply_card(
+                main_text=formatted,
+                tool_steps=tool_steps or None,
+            )
             response = await self._patch_card_message(stale_message_id, card)
             if self._response_succeeded(response):
                 return SendResult(
@@ -1633,14 +1661,39 @@ class FeishuAdapter(BasePlatformAdapter):
             )
 
         # Patch failed: drop the stale id from the registry and send a new
-        # card so the next edit attempt targets the live message.
-        self._card_messages.pop(stale_message_id, None)
-        return await self.send(
+        # card so the next edit attempt targets the live message.  Carry the
+        # accumulated tool_steps over to the fresh card so the user doesn't
+        # see the "执行记录" panel disappear mid-stream.
+        with self._card_state_lock:
+            self._card_messages.pop(stale_message_id, None)
+            self._card_state.pop(stale_message_id, None)
+        result = await self.send(
             chat_id=card_ctx.get("chat_id") or fallback_chat_id,
             content=content,
             reply_to=card_ctx.get("reply_to"),
             metadata=card_ctx.get("metadata"),
         )
+        if result.success and result.message_id and tool_steps:
+            with self._card_state_lock:
+                entry = self._card_state.get(result.message_id)
+                if entry is not None:
+                    entry["tool_steps"] = list(tool_steps)
+            # Re-render the new card with the carried-over tool_steps so the
+            # collapsible panel survives the fallback.  Failure here is
+            # non-fatal — the next edit/append will rebuild it.
+            try:
+                rebuilt = _build_thread_reply_card(
+                    main_text=formatted,
+                    tool_steps=tool_steps,
+                )
+                await self._patch_card_message(result.message_id, rebuilt)
+            except Exception as exc:
+                logger.debug(
+                    "[Feishu] Could not replay tool_steps onto new card %s: %s",
+                    result.message_id,
+                    exc,
+                )
+        return result
 
     async def _patch_card_message(self, message_id: str, card: Dict[str, Any]) -> Any:
         """Patch a previously-sent V2 interactive card in place.
@@ -1653,6 +1706,76 @@ class FeishuAdapter(BasePlatformAdapter):
         body = self._build_patch_message_body(content=payload)
         request = self._build_patch_message_request(message_id=message_id, request_body=body)
         return await asyncio.to_thread(self._client.im.v1.message.patch, request)
+
+    async def append_tool_step(
+        self,
+        message_id: str,
+        step: Dict[str, Any],
+    ) -> SendResult:
+        """Append a tool step to a thread-reply card and patch it in place.
+
+        ``step`` should be a dict with at least ``label`` (and optionally ``tool``
+        for grouping/dedup at the call site).  The label lands inside the
+        collapsible "执行记录" panel so the user can fold it away.
+
+        Returns success without doing anything when ``message_id`` isn't a
+        tracked thread-reply card — callers can fan this out for any message
+        without first checking the registry.  Patch failures don't reshape the
+        card or rotate ids; they're logged and swallowed so progress glitches
+        never break the main response stream.
+        """
+        if not message_id:
+            return SendResult(success=True, message_id=message_id)
+
+        # Snapshot main_text + tool_steps under the lock, then unlock before
+        # the slow PATCH call to avoid blocking the foreign progress thread.
+        with self._card_state_lock:
+            state = self._card_state.get(message_id)
+            if state is None:
+                # Not a thread-reply card we own — silently no-op so the
+                # caller can blindly fan out to every message_id.
+                return SendResult(success=True, message_id=message_id)
+            steps = list(state.get("tool_steps") or [])
+            steps.append(dict(step))
+            state["tool_steps"] = steps
+            main_text = state.get("main_text") or ""
+
+        if not self._client:
+            # State recorded; defer patch until reconnect.  Caller doesn't
+            # care, this is best-effort.
+            return SendResult(success=True, message_id=message_id)
+
+        try:
+            card = _build_thread_reply_card(
+                main_text=main_text,
+                tool_steps=steps,
+            )
+            response = await self._patch_card_message(message_id, card)
+            if self._response_succeeded(response):
+                return SendResult(
+                    success=True,
+                    message_id=message_id,
+                    raw_response=response,
+                )
+            logger.warning(
+                "[Feishu] append_tool_step patch rejected (id=%s code=%s msg=%s)",
+                message_id,
+                getattr(response, "code", "?"),
+                getattr(response, "msg", "?"),
+            )
+            return SendResult(
+                success=False,
+                message_id=message_id,
+                error=str(getattr(response, "msg", "patch rejected")),
+                raw_response=response,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Feishu] append_tool_step failed for %s: %s",
+                message_id,
+                exc,
+            )
+            return SendResult(success=False, message_id=message_id, error=str(exc))
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,

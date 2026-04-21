@@ -7573,6 +7573,37 @@ class GatewayRunner:
                         break
                 return
 
+            # Feishu thread-reply cards accumulate tool steps inside a
+            # collapsible "执行记录" panel on the SAME card as the main
+            # answer.  Detect this once up front; each iteration we'll try
+            # to find the active card's message_id from the stream consumer
+            # (or, as a last resort, the adapter's most recent card entry)
+            # and PATCH the panel.  When no card exists yet (e.g. early
+            # tool fires before the first stream delta), we fall through
+            # to the legacy "extra progress message" path so nothing is
+            # lost.
+            _is_feishu_card_path = source.platform == Platform.FEISHU and hasattr(
+                adapter, "append_tool_step"
+            )
+
+            def _active_feishu_card_id() -> Optional[str]:
+                if not _is_feishu_card_path:
+                    return None
+                _sc = stream_consumer_holder[0]
+                _mid = getattr(_sc, "_message_id", None) if _sc else None
+                if _mid and _mid != "__no_edit__":
+                    _state = getattr(adapter, "_card_state", {}) or {}
+                    if _mid in _state:
+                        return str(_mid)
+                # Fall back: any tracked thread-reply card on the adapter
+                # (e.g. final response shipped before stream consumer
+                # populated _message_id).  Use the most-recently inserted
+                # entry — Python dicts preserve insertion order.
+                _state = getattr(adapter, "_card_state", {}) or {}
+                if _state:
+                    return next(reversed(_state))
+                return None
+
             progress_lines = []      # Accumulated tool lines
             progress_msg_id = None   # ID of the progress message to edit
             can_edit = True          # False once an edit fails (platform doesn't support it)
@@ -7589,9 +7620,55 @@ class GatewayRunner:
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
+                        _is_dedup = True
                     else:
                         msg = raw
                         progress_lines.append(msg)
+                        _is_dedup = False
+
+                    # Feishu card path: try to attach the step to the current
+                    # thread-reply card.  If no card is live yet, drop through
+                    # to the legacy path so the message still gets delivered.
+                    if _is_feishu_card_path and not _is_dedup:
+                        _card_id = _active_feishu_card_id()
+                        if _card_id:
+                            try:
+                                await adapter.append_tool_step(
+                                    _card_id,
+                                    {"tool": last_tool[0] or "tool", "label": msg},
+                                )
+                            except Exception as _exc:
+                                logger.debug(
+                                    "[Feishu] append_tool_step error: %s", _exc
+                                )
+                            # Restore typing indicator just like the legacy path.
+                            await asyncio.sleep(0.3)
+                            await adapter.send_typing(
+                                source.chat_id, metadata=_progress_metadata
+                            )
+                            continue
+                    elif _is_feishu_card_path and _is_dedup:
+                        # Dedup tick on Feishu card path: best-effort patch
+                        # the last step's label with the new (×N) suffix.
+                        _card_id = _active_feishu_card_id()
+                        if _card_id:
+                            try:
+                                _state = getattr(adapter, "_card_state", {}).get(_card_id)
+                                if _state and _state.get("tool_steps"):
+                                    _state["tool_steps"][-1]["label"] = msg
+                                    from gateway.platforms.feishu import (
+                                        _build_thread_reply_card as _btc,
+                                    )
+                                    _card = _btc(
+                                        main_text=_state.get("main_text") or "",
+                                        tool_steps=_state["tool_steps"],
+                                    )
+                                    await adapter._patch_card_message(_card_id, _card)
+                            except Exception as _exc:
+                                logger.debug(
+                                    "[Feishu] dedup patch error: %s", _exc
+                                )
+                            continue
 
                     # Throttle edits: batch rapid tool updates into fewer
                     # API calls to avoid hitting Telegram flood control.
@@ -7647,6 +7724,7 @@ class GatewayRunner:
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
                     # Drain remaining queued messages
+                    _drained_steps: list[str] = []
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
@@ -7654,10 +7732,28 @@ class GatewayRunner:
                                 _, base_msg, count = raw
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                                if _drained_steps:
+                                    _drained_steps[-1] = f"{base_msg} (×{count + 1})"
                             else:
                                 progress_lines.append(raw)
+                                _drained_steps.append(raw)
                         except Exception:
                             break
+                    # Feishu card path: flush each drained step into the
+                    # collapsible panel; nothing to edit on the legacy
+                    # progress surface (we never created one).
+                    if _is_feishu_card_path and _drained_steps:
+                        _card_id = _active_feishu_card_id()
+                        if _card_id:
+                            for _line in _drained_steps:
+                                try:
+                                    await adapter.append_tool_step(
+                                        _card_id,
+                                        {"tool": last_tool[0] or "tool", "label": _line},
+                                    )
+                                except Exception:
+                                    pass
+                        return
                     # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
                         full_text = "\n".join(progress_lines)
