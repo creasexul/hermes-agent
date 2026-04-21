@@ -529,6 +529,13 @@ class GatewayStreamConsumer:
                         self._last_sent_text = text
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
+                        # If the adapter swapped to a fresh message id (e.g.
+                        # Feishu card patch failed and the adapter shipped a
+                        # brand-new card to keep the stream alive), follow the
+                        # new id so the next edit targets the live message.
+                        new_id = getattr(result, "message_id", None)
+                        if new_id and str(new_id) != self._message_id:
+                            self._message_id = str(new_id)
                         return True
                     else:
                         # Edit failed.  If this looks like flood control / rate

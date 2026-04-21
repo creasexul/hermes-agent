@@ -155,6 +155,26 @@ class TestSendOrEditMediaStripping:
 
         adapter.send.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_edit_follows_new_message_id_returned_by_adapter(self):
+        """If the adapter rotated to a fresh message id (e.g. Feishu card patch
+        failed and the adapter shipped a new card), the consumer must follow
+        the new id so subsequent edits target the live message."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_old")
+        # First edit returns a *different* message id — the adapter swapped to
+        # a fresh message internally.
+        edit_result = SimpleNamespace(success=True, message_id="msg_new")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=edit_result)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        await consumer._send_or_edit("Hello")
+        assert consumer._message_id == "msg_old"
+        await consumer._send_or_edit("Hello world")
+        assert consumer._message_id == "msg_new"
+
 
 # ── Integration: full stream run ─────────────────────────────────────────
 

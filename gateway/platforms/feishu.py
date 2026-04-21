@@ -66,6 +66,8 @@ try:
         GetMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageMessageReadV1,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
         UpdateMessageRequest,
@@ -1181,6 +1183,11 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        # Thread-reply card registry: message_id → {chat_id, reply_to, metadata}.
+        # Populated when send() ships a V2 interactive card; consulted by
+        # edit_message() so subsequent stream deltas patch the same card
+        # instead of editing it as text/post.
+        self._card_messages: Dict[str, Dict[str, Any]] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1477,7 +1484,18 @@ class FeishuAdapter(BasePlatformAdapter):
                     metadata=metadata,
                 )
                 if self._response_succeeded(card_response):
-                    return self._finalize_send_result(card_response, "send failed")
+                    result = self._finalize_send_result(card_response, "send failed")
+                    if result.success and result.message_id:
+                        # Remember send-time context so a later edit_message can
+                        # patch the same card or, if the patch fails, fall back
+                        # to shipping a fresh card without losing thread/reply
+                        # placement.
+                        self._card_messages[result.message_id] = {
+                            "chat_id": chat_id,
+                            "reply_to": reply_to,
+                            "metadata": metadata,
+                        }
+                    return result
                 logger.warning(
                     "[Feishu] Thread-reply card rejected (code=%s msg=%s); "
                     "falling back to text path",
@@ -1545,6 +1563,21 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        # Thread-reply card path: when this message_id was previously shipped
+        # as a V2 interactive card, patch the card in place so streaming
+        # updates land on the same surface (one card per turn) instead of
+        # leaking through the text update API and being rejected. If the
+        # patch is rejected, fall back to sending a brand-new card so the
+        # stream stays unbroken.
+        card_ctx = self._card_messages.get(message_id)
+        if card_ctx is not None:
+            return await self._edit_thread_reply_card(
+                stale_message_id=message_id,
+                card_ctx=card_ctx,
+                fallback_chat_id=chat_id,
+                content=content,
+            )
+
         try:
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
@@ -1566,6 +1599,60 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def _edit_thread_reply_card(
+        self,
+        *,
+        stale_message_id: str,
+        card_ctx: Dict[str, Any],
+        fallback_chat_id: str,
+        content: str,
+    ) -> SendResult:
+        """Patch an in-place card; on failure, ship a new card to keep streaming alive."""
+        formatted = self.format_message(content)
+        try:
+            card = _build_thread_reply_card(main_text=formatted)
+            response = await self._patch_card_message(stale_message_id, card)
+            if self._response_succeeded(response):
+                return SendResult(
+                    success=True,
+                    message_id=stale_message_id,
+                    raw_response=response,
+                )
+            logger.warning(
+                "[Feishu] Card patch rejected (id=%s code=%s msg=%s); resending as new card",
+                stale_message_id,
+                getattr(response, "code", "?"),
+                getattr(response, "msg", "?"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Feishu] Card patch failed for %s: %s; resending as new card",
+                stale_message_id,
+                exc,
+            )
+
+        # Patch failed: drop the stale id from the registry and send a new
+        # card so the next edit attempt targets the live message.
+        self._card_messages.pop(stale_message_id, None)
+        return await self.send(
+            chat_id=card_ctx.get("chat_id") or fallback_chat_id,
+            content=content,
+            reply_to=card_ctx.get("reply_to"),
+            metadata=card_ctx.get("metadata"),
+        )
+
+    async def _patch_card_message(self, message_id: str, card: Dict[str, Any]) -> Any:
+        """Patch a previously-sent V2 interactive card in place.
+
+        Maps to ``PATCH /open-apis/im/v1/messages/{message_id}``. The card body
+        must include ``config.update_multi: true`` (set by
+        :func:`_build_thread_reply_card`) for the patch to be accepted.
+        """
+        payload = json.dumps(card, ensure_ascii=False)
+        body = self._build_patch_message_body(content=payload)
+        request = self._build_patch_message_request(message_id=message_id, request_body=body)
+        return await asyncio.to_thread(self._client.im.v1.message.patch, request)
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -3677,6 +3764,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if "UpdateMessageRequest" in globals():
             return (
                 UpdateMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        if "PatchMessageRequestBody" in globals():
+            return PatchMessageRequestBody.builder().content(content).build()
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if "PatchMessageRequest" in globals():
+            return (
+                PatchMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
                 .build()

@@ -437,6 +437,210 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_thread_reply_card_registers_message_id_for_patch(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _ReplyAPI:
+            def reply(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_card_001"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_ReplyAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="hello card",
+                    reply_to="om_thread_root",
+                    metadata={"thread_id": "omt-thread"},
+                )
+            )
+
+        # The thread-card path returns the message_id so the stream consumer
+        # can later edit (patch) the same card.
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_card_001")
+        # The interactive (card) request was used.
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        # The send-time context is registered so edit_message routes to patch.
+        self.assertIn("om_card_001", adapter._card_messages)
+        ctx = adapter._card_messages["om_card_001"]
+        self.assertEqual(ctx["chat_id"], "oc_chat")
+        self.assertEqual(ctx["reply_to"], "om_thread_root")
+        self.assertEqual(ctx["metadata"], {"thread_id": "omt-thread"})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_edit_message_patches_known_card_instead_of_text_update(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"patch": None, "update_calls": 0}
+
+        class _MessageAPI:
+            def patch(self, request):
+                captured["patch"] = request
+                return SimpleNamespace(success=lambda: True)
+
+            def update(self, request):
+                captured["update_calls"] += 1
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        # Pre-register the message_id as a card (as send() would have done).
+        adapter._card_messages["om_card_001"] = {
+            "chat_id": "oc_chat",
+            "reply_to": "om_thread_root",
+            "metadata": {"thread_id": "omt-thread"},
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_card_001",
+                    content="updated body",
+                )
+            )
+
+        # Patch was used, not the text update path.
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_card_001")
+        self.assertIsNotNone(captured["patch"])
+        self.assertEqual(captured["update_calls"], 0)
+        # The patched payload is a JSON-encoded V2 card with update_multi=true.
+        patched_card = json.loads(captured["patch"].request_body.content)
+        self.assertEqual(patched_card["schema"], "2.0")
+        self.assertTrue(patched_card["config"]["update_multi"])
+        self.assertEqual(
+            patched_card["body"]["elements"][0],
+            {"tag": "markdown", "content": "updated body"},
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_edit_message_falls_back_to_new_card_when_patch_fails(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"patch_calls": 0, "reply_calls": 0}
+
+        class _MessageAPI:
+            def patch(self, request):
+                captured["patch_calls"] += 1
+                return SimpleNamespace(success=lambda: False, code=230020, msg="card schema rejected")
+
+            def reply(self, request):
+                captured["reply_calls"] += 1
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_card_002"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        adapter._card_messages["om_card_001"] = {
+            "chat_id": "oc_chat",
+            "reply_to": "om_thread_root",
+            "metadata": {"thread_id": "omt-thread"},
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_card_001",
+                    content="updated body",
+                )
+            )
+
+        # Patch was attempted, then a fresh card was sent via reply.
+        self.assertEqual(captured["patch_calls"], 1)
+        self.assertEqual(captured["reply_calls"], 1)
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_card_002")
+        # Stale id was evicted; new id registered for subsequent edits.
+        self.assertNotIn("om_card_001", adapter._card_messages)
+        self.assertIn("om_card_002", adapter._card_messages)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_edit_message_does_not_patch_for_unregistered_message_id(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"patch_calls": 0, "update_calls": 0}
+
+        class _MessageAPI:
+            def patch(self, request):
+                captured["patch_calls"] += 1
+                return SimpleNamespace(success=lambda: True)
+
+            def update(self, request):
+                captured["update_calls"] += 1
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_plain_text",
+                    content="just text",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["patch_calls"], 0)
+        self.assertEqual(captured["update_calls"], 1)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_get_chat_info_uses_real_feishu_chat_api(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
