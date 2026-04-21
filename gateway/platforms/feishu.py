@@ -430,6 +430,115 @@ def _build_markdown_post_payload(content: str) -> str:
     )
 
 
+def _make_collapsible_panel(
+    *,
+    label: str,
+    elements: List[Dict[str, Any]],
+    expanded: bool = False,
+) -> Dict[str, Any]:
+    """Build a Feishu V2 ``collapsible_panel`` element.
+
+    The visual style mirrors Mavis' ``makeCollapsiblePanel`` so the folded
+    panel feels native: small grey chevron on the right, rotates 180° when
+    expanded, rounded grey border.
+    """
+    return {
+        "tag": "collapsible_panel",
+        "expanded": expanded,
+        "header": {
+            "title": {"tag": "plain_text", "content": label},
+            "vertical_align": "center",
+            "padding": "4px 0px 4px 8px",
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "color": "grey",
+                "size": "16px 16px",
+            },
+            "icon_position": "right",
+            "icon_expanded_angle": 180,
+        },
+        "vertical_spacing": "2px",
+        "background_color": "default",
+        "border": {"color": "grey", "corner_radius": "5px"},
+        "elements": elements,
+    }
+
+
+def _tool_step_to_div(step: Dict[str, Any]) -> Dict[str, Any]:
+    """Render one tool step ({tool, label}) as a Feishu ``div`` element."""
+    label = str(step.get("label", "") or "")
+    return {
+        "tag": "div",
+        "icon": {
+            "tag": "standard_icon",
+            "token": "tools_outlined",
+            "color": "grey",
+        },
+        "text": {"tag": "plain_text", "content": label},
+    }
+
+
+def _build_thread_reply_card(
+    main_text: str,
+    *,
+    thinking: Optional[str] = None,
+    tool_steps: Optional[List[Dict[str, Any]]] = None,
+    bot_name: str = "Hermes",
+) -> Dict[str, Any]:
+    """Build a Feishu V2 card for an in-thread reply.
+
+    The main answer is rendered as a top-level markdown element; optional
+    ``thinking`` text and ``tool_steps`` are placed inside native
+    ``collapsible_panel`` elements (thinking expanded, tool steps folded).
+
+    The returned object is a plain ``dict`` — callers are expected to
+    ``json.dumps(..., ensure_ascii=False)`` it before sending.
+
+    ``config.update_multi`` is set to ``True`` so the same card may later
+    be PATCH-updated via the Feishu update API.
+    """
+    elements: List[Dict[str, Any]] = [
+        {"tag": "markdown", "content": main_text},
+    ]
+
+    if thinking:
+        elements.append({"tag": "hr"})
+        elements.append(
+            _make_collapsible_panel(
+                label="Thinking",
+                elements=[{"tag": "markdown", "content": thinking}],
+                expanded=True,
+            )
+        )
+
+    if tool_steps:
+        step_count = len(tool_steps)
+        plural = "step" if step_count == 1 else "steps"
+        elements.append({"tag": "hr"})
+        elements.append(
+            _make_collapsible_panel(
+                label=f"执行记录 · {step_count} {plural}",
+                elements=[_tool_step_to_div(step) for step in tool_steps],
+                expanded=False,
+            )
+        )
+
+    return {
+        "schema": "2.0",
+        "config": {
+            "wide_screen_mode": True,
+            "update_multi": True,
+            "streaming_mode": False,
+        },
+        "header": {
+            "title": {"tag": "plain_text", "content": bot_name},
+            "template": "blue",
+        },
+        "body": {"elements": elements},
+    }
+
+
 def parse_feishu_post_payload(payload: Any) -> FeishuPostParseResult:
     resolved = _resolve_post_payload(payload)
     if not resolved:
@@ -1343,6 +1452,44 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
+
+        # Thread-reply card path: when delivering into a Feishu topic
+        # (thread), wrap the main answer in a V2 interactive card so we
+        # can later attach collapsible panels for thinking / tool-call
+        # traces. Skip slash-style command echoes — those are short
+        # status strings that look noisy inside a card. Any failure
+        # (network exception or Feishu code != 0) falls through to the
+        # original text/post path so users never lose a message.
+        thread_id = (metadata or {}).get("thread_id") if metadata else None
+        if (
+            thread_id
+            and formatted
+            and not formatted.lstrip().startswith("/")
+        ):
+            try:
+                card = _build_thread_reply_card(main_text=formatted)
+                card_payload = json.dumps(card, ensure_ascii=False)
+                card_response = await self._feishu_send_with_retry(
+                    chat_id=chat_id,
+                    msg_type="interactive",
+                    payload=card_payload,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                if self._response_succeeded(card_response):
+                    return self._finalize_send_result(card_response, "send failed")
+                logger.warning(
+                    "[Feishu] Thread-reply card rejected (code=%s msg=%s); "
+                    "falling back to text path",
+                    getattr(card_response, "code", "?"),
+                    getattr(card_response, "msg", "?"),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Feishu] Thread-reply card send failed, falling back to text: %s",
+                    exc,
+                )
+
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
 
