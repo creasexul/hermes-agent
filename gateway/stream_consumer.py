@@ -100,6 +100,20 @@ class GatewayStreamConsumer:
         """True when the stream consumer delivered the final assistant reply."""
         return self._final_response_sent
 
+    def adopt_message_id(self, message_id: str) -> None:
+        """Adopt a pre-existing platform message id as the current edit target.
+
+        Used when the gateway pre-sends a placeholder message before streaming
+        starts (e.g. Feishu thread-reply cards) so subsequent stream deltas
+        ``edit_message`` that placeholder instead of sending a new one.
+        Marks the consumer as already-sent — the placeholder is itself a
+        user-visible message.
+        """
+        if not message_id:
+            return
+        self._message_id = str(message_id)
+        self._already_sent = True
+
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
         self._queue.put(_NEW_SEGMENT)

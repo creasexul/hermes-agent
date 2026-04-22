@@ -7775,6 +7775,11 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+        # Feishu thread-reply placeholder card id.  Pre-sent below (when the
+        # platform/feature conditions match) so all subsequent tool progress
+        # and the final response land on the same card surface.  Per-call
+        # local state — never leaks between turns.
+        _feishu_placeholder_card_id_holder: List[Optional[str]] = [None]
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_event_loop()
@@ -7937,6 +7942,12 @@ class GatewayRunner:
                         )
                         if _want_stream_deltas:
                             _stream_delta_cb = _stream_consumer.on_delta
+                        # If we pre-sent a Feishu thread-reply placeholder card,
+                        # let the stream consumer adopt it so its first edit
+                        # targets the same card instead of sending a fresh one.
+                        _adopt_id = _feishu_placeholder_card_id_holder[0]
+                        if _adopt_id:
+                            _stream_consumer.adopt_message_id(_adopt_id)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -8327,6 +8338,38 @@ class GatewayRunner:
                 "response_previewed": result.get("response_previewed", False),
             }
         
+        # ── Feishu thread-reply: pre-send placeholder card ──────────────
+        # In thread-reply scenarios, ship a tiny "…" placeholder card NOW
+        # so all subsequent tool-progress patches and the final response
+        # PATCH the same card surface.  Without this, tool progress (which
+        # fires before the agent's first stream delta) has no card to land
+        # on and falls through to the legacy "extra progress message" path,
+        # producing a separate card next to the final response.
+        # Failure here is non-fatal: the placeholder id stays None and the
+        # legacy path runs unchanged.
+        _feishu_adapter_for_placeholder = self.adapters.get(source.platform)
+        if (
+            source.platform == Platform.FEISHU
+            and _progress_thread_id
+            and _feishu_adapter_for_placeholder is not None
+            and hasattr(_feishu_adapter_for_placeholder, "append_tool_step")
+        ):
+            try:
+                _placeholder_result = await _feishu_adapter_for_placeholder.send(
+                    chat_id=source.chat_id,
+                    content="…",
+                    reply_to=_progress_reply_to,
+                    metadata=_progress_metadata,
+                )
+                if _placeholder_result.success and _placeholder_result.message_id:
+                    _feishu_placeholder_card_id_holder[0] = str(
+                        _placeholder_result.message_id
+                    )
+            except Exception as _ph_exc:
+                logger.debug(
+                    "[Feishu] placeholder card send failed: %s", _ph_exc
+                )
+
         # Start progress message sender if enabled
         progress_task = None
         if tool_progress_enabled:
@@ -8745,14 +8788,36 @@ class GatewayRunner:
                     )
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
-                        try:
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to send first response before queued message: %s", e)
+                        # Prefer editing a pre-sent Feishu thread-reply
+                        # placeholder card so the first response lands on
+                        # the same surface as the tool-progress panel.
+                        _ph_id = _feishu_placeholder_card_id_holder[0]
+                        _sent_via_placeholder = False
+                        if _ph_id:
+                            try:
+                                _ph_edit = await adapter.edit_message(
+                                    chat_id=source.chat_id,
+                                    message_id=_ph_id,
+                                    content=first_response,
+                                )
+                                _sent_via_placeholder = bool(
+                                    getattr(_ph_edit, "success", False)
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    "[Feishu] placeholder edit before queued "
+                                    "message failed: %s",
+                                    e,
+                                )
+                        if not _sent_via_placeholder:
+                            try:
+                                await adapter.send(
+                                    source.chat_id,
+                                    first_response,
+                                    metadata=_status_thread_metadata,
+                                )
+                            except Exception as e:
+                                logger.warning("Failed to send first response before queued message: %s", e)
                 # else: interrupted — discard the interrupted response ("Operation
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
@@ -8833,7 +8898,38 @@ class GatewayRunner:
                 )
             ):
                 response["already_sent"] = True
-        
+
+        # ── Feishu thread-reply: edit placeholder with final response ───
+        # When a placeholder card was pre-sent and streaming didn't deliver
+        # the final response (the common case with display.streaming=false
+        # or when the agent never streams text), patch the card in place
+        # via edit_message — the adapter routes through
+        # _edit_thread_reply_card and preserves accumulated tool_steps.
+        # Also runs on agent failure so the placeholder shows the error
+        # instead of a stuck "…".
+        _placeholder_card_id = _feishu_placeholder_card_id_holder[0]
+        if (
+            _placeholder_card_id
+            and isinstance(response, dict)
+            and not response.get("already_sent")
+        ):
+            _placeholder_adapter = self.adapters.get(source.platform)
+            _final_text = response.get("final_response") or ""
+            if _placeholder_adapter is not None and _final_text:
+                try:
+                    _edit_result = await _placeholder_adapter.edit_message(
+                        chat_id=source.chat_id,
+                        message_id=_placeholder_card_id,
+                        content=_final_text,
+                    )
+                    if getattr(_edit_result, "success", False):
+                        response["already_sent"] = True
+                except Exception as _edit_exc:
+                    logger.debug(
+                        "[Feishu] placeholder final edit failed: %s",
+                        _edit_exc,
+                    )
+
         return response
 
 

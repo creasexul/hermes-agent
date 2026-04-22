@@ -308,5 +308,172 @@ def test_append_tool_step_no_client_records_state_only() -> None:
     assert adapter._card_state["om_card_4"]["tool_steps"] == [{"tool": "t", "label": "L"}]
 
 
+# ---------------------------------------------------------------------------
+# Placeholder card flow: pre-send "…" so tool steps + final response land on
+# the same card surface (covers the gateway/run.py wiring at the adapter
+# boundary — gateway integration itself isn't unit-tested here).
+# ---------------------------------------------------------------------------
+
+
+def _ok_send_response(message_id: str) -> MagicMock:
+    """Mock a successful Feishu send response carrying ``message_id``."""
+    resp = MagicMock()
+    resp.success = lambda: True
+    resp.code = 0
+    resp.msg = "ok"
+    data = MagicMock()
+    data.message_id = message_id
+    resp.data = data
+    return resp
+
+
+def test_send_placeholder_card_initializes_card_state() -> None:
+    """A successful thread-reply card send registers ``_card_state`` so later
+    ``append_tool_step`` and ``edit_message`` calls can find it."""
+    adapter = _make_adapter()
+    adapter._feishu_send_with_retry = AsyncMock(
+        return_value=_ok_send_response("om_placeholder_1")
+    )
+
+    result = asyncio.run(
+        adapter.send(
+            chat_id="oc_chat",
+            content="…",
+            reply_to="om_anchor",
+            metadata={"thread_id": "omt_topic"},
+        )
+    )
+
+    assert result.success is True
+    assert result.message_id == "om_placeholder_1"
+
+    # _card_messages tracks send-time context (chat_id, reply_to, metadata)
+    ctx = adapter._card_messages["om_placeholder_1"]
+    assert ctx["chat_id"] == "oc_chat"
+    assert ctx["reply_to"] == "om_anchor"
+    assert ctx["metadata"] == {"thread_id": "omt_topic"}
+
+    # _card_state ready for tool_steps accumulation
+    state = adapter._card_state["om_placeholder_1"]
+    assert state["tool_steps"] == []
+    assert state["main_text"] == "…"
+
+    # The send went through the interactive (card) path, not the text path
+    call = adapter._feishu_send_with_retry.await_args
+    assert call.kwargs.get("msg_type") == "interactive"
+
+
+def test_edit_message_after_placeholder_uses_card_path() -> None:
+    """``edit_message`` on a tracked placeholder PATCHes the card, not the
+    text/post update API."""
+    adapter = _make_adapter()
+    _register_card(adapter, "om_placeholder_2", main_text="…")
+    adapter._patch_card_message = AsyncMock(return_value=_ok_response())
+    # If the test path leaks into the normal text/post update API, this mock
+    # would be called — assert at the end that it wasn't.
+    adapter._client.im.v1.message.update = MagicMock()
+
+    result = asyncio.run(
+        adapter.edit_message(
+            chat_id="oc_chat",
+            message_id="om_placeholder_2",
+            content="final answer",
+        )
+    )
+
+    assert result.success is True
+    assert result.message_id == "om_placeholder_2"
+    adapter._patch_card_message.assert_awaited_once()
+    adapter._client.im.v1.message.update.assert_not_called()
+
+    # Card body's main markdown reflects the edited content
+    card = _captured_card(adapter._patch_card_message)
+    assert card["body"]["elements"][0]["content"] == "final answer"
+    # main_text in state was updated by the edit so future patches re-render it
+    assert adapter._card_state["om_placeholder_2"]["main_text"] == "final answer"
+
+
+def test_append_tool_step_then_edit_message_preserves_steps() -> None:
+    """End-to-end via the public adapter surface: register placeholder →
+    append two steps → edit_message with final text → final card has the
+    new main markdown AND both tool steps in the collapsible panel."""
+    adapter = _make_adapter()
+    _register_card(adapter, "om_placeholder_3", main_text="…")
+
+    patches: list = []
+
+    async def _record_patch(message_id, card):
+        patches.append((message_id, json.loads(json.dumps(card))))
+        return _ok_response()
+
+    adapter._patch_card_message = AsyncMock(side_effect=_record_patch)
+
+    asyncio.run(
+        adapter.append_tool_step(
+            "om_placeholder_3", {"tool": "bash", "label": "ls /"},
+        )
+    )
+    asyncio.run(
+        adapter.append_tool_step(
+            "om_placeholder_3", {"tool": "read", "label": "a.py"},
+        )
+    )
+    final = asyncio.run(
+        adapter.edit_message(
+            chat_id="oc_chat",
+            message_id="om_placeholder_3",
+            content="here is the answer",
+        )
+    )
+
+    assert final.success is True
+    # 2 appends + 1 final edit = 3 patches
+    assert len(patches) == 3
+    last_id, last_card = patches[-1]
+    assert last_id == "om_placeholder_3"
+    assert last_card["body"]["elements"][0]["content"] == "here is the answer"
+
+    panels = [
+        e for e in last_card["body"]["elements"]
+        if e.get("tag") == "collapsible_panel"
+    ]
+    assert len(panels) == 1
+    labels = [d["text"]["content"] for d in panels[0]["elements"]
+              if d.get("tag") == "div"]
+    assert labels == ["ls /", "a.py"]
+
+
+# ---------------------------------------------------------------------------
+# GatewayStreamConsumer.adopt_message_id: covers the streaming-on path
+# where the consumer must inherit the placeholder card id so its first
+# edit lands on the same surface.
+# ---------------------------------------------------------------------------
+
+
+def test_stream_consumer_adopt_message_id_targets_placeholder() -> None:
+    """``adopt_message_id`` makes the consumer treat the given id as the
+    current edit target and mark it as already sent."""
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    consumer = GatewayStreamConsumer(adapter=MagicMock(), chat_id="oc_chat")
+    assert consumer._message_id is None
+    assert consumer.already_sent is False
+
+    consumer.adopt_message_id("om_placeholder_4")
+
+    assert consumer._message_id == "om_placeholder_4"
+    assert consumer.already_sent is True
+
+
+def test_stream_consumer_adopt_message_id_ignores_empty() -> None:
+    """Empty/None message_id is a no-op (placeholder send may have failed)."""
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    consumer = GatewayStreamConsumer(adapter=MagicMock(), chat_id="oc_chat")
+    consumer.adopt_message_id("")
+    assert consumer._message_id is None
+    assert consumer.already_sent is False
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))
