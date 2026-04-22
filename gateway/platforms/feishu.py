@@ -1499,6 +1499,12 @@ class FeishuAdapter(BasePlatformAdapter):
                         # patch the same card or, if the patch fails, fall back
                         # to shipping a fresh card without losing thread/reply
                         # placement.
+                        # TODO: bound _card_messages / _card_state growth.
+                        # Today entries are only evicted on patch failure
+                        # (_edit_thread_reply_card).  Long-running gateways
+                        # accumulate one entry per thread-reply card sent,
+                        # made worse by the per-turn placeholder card pre-sent
+                        # from gateway/run.py.  Add an LRU cap or a TTL sweep.
                         with self._card_state_lock:
                             self._card_messages[result.message_id] = {
                                 "chat_id": chat_id,

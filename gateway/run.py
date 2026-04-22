@@ -8905,8 +8905,10 @@ class GatewayRunner:
         # or when the agent never streams text), patch the card in place
         # via edit_message — the adapter routes through
         # _edit_thread_reply_card and preserves accumulated tool_steps.
-        # Also runs on agent failure so the placeholder shows the error
-        # instead of a stuck "…".
+        # Also covers caught-and-formatted error responses (e.g. provider
+        # auth failures that set final_response="⚠️ ..."); the placeholder
+        # is left as "…" if final_response is empty (uncaught exceptions
+        # above this point bypass it entirely — out of scope here).
         _placeholder_card_id = _feishu_placeholder_card_id_holder[0]
         if (
             _placeholder_card_id
