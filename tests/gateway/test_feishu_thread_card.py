@@ -495,54 +495,74 @@ def test_stream_consumer_adopt_message_id_ignores_empty() -> None:
 
 def test_send_second_call_for_same_thread_patches_primary_card() -> None:
     """When a live card already exists for (chat_id, thread_id), a second
-    send() patches it via _update_main_text instead of creating a new card."""
+    send() patches it via _update_main_text instead of creating a new card.
+
+    The (chat_id, thread_id) -> message_id mapping now lives in the
+    per-call ``_PRIMARY_CARD_HOLDER`` ContextVar (set by gateway.run for
+    every ``_run_agent`` invocation), so the test seeds the holder
+    explicitly before invoking ``send()``.
+    """
+    from gateway.platforms.feishu import _PRIMARY_CARD_HOLDER
+
     adapter = _make_adapter()
     # Manually register a primary card (simulating the placeholder that was
     # pre-sent by run.py before streaming started).
     _register_card(adapter, "om_primary", main_text="…")
-    adapter._primary_card[("oc_chat", "omt_topic")] = "om_primary"
-    adapter._patch_card_message = AsyncMock(return_value=_ok_response())
+    _holder = {("oc_chat", "omt_topic"): "om_primary"}
+    _token = _PRIMARY_CARD_HOLDER.set(_holder)
+    try:
+        adapter._patch_card_message = AsyncMock(return_value=_ok_response())
 
-    result = asyncio.run(
-        adapter.send(
-            chat_id="oc_chat",
-            content="streaming update",
-            reply_to="om_anchor",
-            metadata={"thread_id": "omt_topic"},
+        result = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="streaming update",
+                reply_to="om_anchor",
+                metadata={"thread_id": "omt_topic"},
+            )
         )
-    )
 
-    # Must return the SAME primary card id — NOT a new one
-    assert result.success is True
-    assert result.message_id == "om_primary"
+        # Must return the SAME primary card id — NOT a new one
+        assert result.success is True
+        assert result.message_id == "om_primary"
 
-    # _update_main_text must have patched the card (no new send to Feishu)
-    adapter._patch_card_message.assert_awaited_once()
-    card = _captured_card(adapter._patch_card_message)
-    assert card["body"]["elements"][0]["content"] == "streaming update"
+        # _update_main_text must have patched the card (no new send to Feishu)
+        adapter._patch_card_message.assert_awaited_once()
+        card = _captured_card(adapter._patch_card_message)
+        assert card["body"]["elements"][0]["content"] == "streaming update"
 
-    # State was updated too
-    assert adapter._card_state["om_primary"]["main_text"] == "streaming update"
+        # State was updated too
+        assert adapter._card_state["om_primary"]["main_text"] == "streaming update"
+    finally:
+        _PRIMARY_CARD_HOLDER.reset(_token)
 
 
 def test_send_first_call_registers_primary_card() -> None:
     """The very first send() for a (chat_id, thread_id) creates a new card
-    AND registers it as the primary so subsequent calls route to patch."""
+    AND registers it in the per-call ContextVar holder so subsequent calls
+    in the same turn route to patch."""
+    from gateway.platforms.feishu import _PRIMARY_CARD_HOLDER
+
     adapter = _make_adapter()
     adapter._feishu_send_with_retry = AsyncMock(
         return_value=_ok_send_response("om_new_card")
     )
-
-    asyncio.run(
-        adapter.send(
-            chat_id="oc_chat",
-            content="hello",
-            reply_to="om_anchor",
-            metadata={"thread_id": "omt_topic"},
+    _holder: dict = {}
+    _token = _PRIMARY_CARD_HOLDER.set(_holder)
+    try:
+        asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="hello",
+                reply_to="om_anchor",
+                metadata={"thread_id": "omt_topic"},
+            )
         )
-    )
+    finally:
+        _PRIMARY_CARD_HOLDER.reset(_token)
 
-    assert adapter._primary_card.get(("oc_chat", "omt_topic")) == "om_new_card"
+    # The send registered the new card in THIS call's holder.
+    assert _holder.get(("oc_chat", "omt_topic")) == "om_new_card"
 
 
 def test_update_main_text_patches_with_current_tool_steps() -> None:
@@ -588,3 +608,218 @@ def test_update_main_text_returns_success_even_on_patch_failure() -> None:
     assert result.message_id == "om_card_6"
     # State still updated (next patch will re-apply)
     assert adapter._card_state["om_card_6"]["main_text"] == "new"
+
+
+# ---------------------------------------------------------------------------
+# Per-call holder lifetime: cross-query / cross-thread isolation
+# ---------------------------------------------------------------------------
+
+
+def test_two_queries_in_same_thread_create_two_independent_cards() -> None:
+    """Two consecutive turns in the same (chat_id, thread_id) — each with its
+    own per-call holder, mimicking what gateway.run._run_agent does — must
+    create TWO different cards.  Regression guard: the previous adapter-level
+    ``self._primary_card`` dict caused turn 2 to patch turn 1's card."""
+    from gateway.platforms.feishu import _PRIMARY_CARD_HOLDER
+
+    adapter = _make_adapter()
+    # Each call returns a fresh message_id so we can tell the cards apart.
+    adapter._feishu_send_with_retry = AsyncMock(
+        side_effect=[
+            _ok_send_response("om_turn_1"),
+            _ok_send_response("om_turn_2"),
+        ]
+    )
+    # Patch path must NOT be invoked — every turn ships a fresh card.
+    adapter._patch_card_message = AsyncMock(return_value=_ok_response())
+
+    # ---- Turn 1: fresh per-call holder ----
+    _holder_1: dict = {}
+    _token_1 = _PRIMARY_CARD_HOLDER.set(_holder_1)
+    try:
+        r1 = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="first query",
+                reply_to="om_anchor_1",
+                metadata={"thread_id": "omt_topic"},
+            )
+        )
+    finally:
+        _PRIMARY_CARD_HOLDER.reset(_token_1)
+
+    # ---- Turn 2: fresh per-call holder (key insight: NEW dict, not the
+    # turn-1 one) ----
+    _holder_2: dict = {}
+    _token_2 = _PRIMARY_CARD_HOLDER.set(_holder_2)
+    try:
+        r2 = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="second query",
+                reply_to="om_anchor_2",
+                metadata={"thread_id": "omt_topic"},
+            )
+        )
+    finally:
+        _PRIMARY_CARD_HOLDER.reset(_token_2)
+
+    # Two different cards
+    assert r1.success is True and r2.success is True
+    assert r1.message_id == "om_turn_1"
+    assert r2.message_id == "om_turn_2"
+    assert r1.message_id != r2.message_id
+
+    # Each holder ended up with its own card id (no cross-contamination)
+    assert _holder_1.get(("oc_chat", "omt_topic")) == "om_turn_1"
+    assert _holder_2.get(("oc_chat", "omt_topic")) == "om_turn_2"
+
+    # Critical: turn 2 did NOT patch turn 1's card
+    adapter._patch_card_message.assert_not_called()
+    # Both turns went through the create-card path
+    assert adapter._feishu_send_with_retry.await_count == 2
+
+
+def test_two_sends_in_same_query_patch_the_same_card() -> None:
+    """Within a single turn (= single per-call holder), a follow-up send()
+    after the initial card is shipped must PATCH the existing card rather
+    than creating a new one.  Mirrors the stream-consumer flow where a
+    segment break resets ``_message_id=None`` and the consumer calls
+    ``send()`` again on the same surface."""
+    from gateway.platforms.feishu import _PRIMARY_CARD_HOLDER
+
+    adapter = _make_adapter()
+    # Only the FIRST send must call the create API; the second goes through
+    # _update_main_text -> _patch_card_message.
+    adapter._feishu_send_with_retry = AsyncMock(
+        return_value=_ok_send_response("om_only_card")
+    )
+    adapter._patch_card_message = AsyncMock(return_value=_ok_response())
+
+    _holder: dict = {}
+    _token = _PRIMARY_CARD_HOLDER.set(_holder)
+    try:
+        r1 = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="first chunk",
+                reply_to="om_anchor",
+                metadata={"thread_id": "omt_topic"},
+            )
+        )
+        r2 = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="second chunk",
+                reply_to="om_anchor",
+                metadata={"thread_id": "omt_topic"},
+            )
+        )
+    finally:
+        _PRIMARY_CARD_HOLDER.reset(_token)
+
+    # Both sends report the same message id (the original card)
+    assert r1.message_id == "om_only_card"
+    assert r2.message_id == "om_only_card"
+
+    # Only ONE create-card API call (the first); the second was a patch
+    assert adapter._feishu_send_with_retry.await_count == 1
+    adapter._patch_card_message.assert_awaited_once()
+    card = _captured_card(adapter._patch_card_message)
+    assert card["body"]["elements"][0]["content"] == "second chunk"
+    # State reflects the latest content
+    assert adapter._card_state["om_only_card"]["main_text"] == "second chunk"
+
+
+def test_same_chat_different_thread_uses_different_cards() -> None:
+    """Even within a single per-call holder, two different thread_ids in the
+    same chat get their own cards — the holder is keyed by
+    (chat_id, thread_id).  Guards against accidental sharing across threads."""
+    from gateway.platforms.feishu import _PRIMARY_CARD_HOLDER
+
+    adapter = _make_adapter()
+    adapter._feishu_send_with_retry = AsyncMock(
+        side_effect=[
+            _ok_send_response("om_thread_a"),
+            _ok_send_response("om_thread_b"),
+        ]
+    )
+    adapter._patch_card_message = AsyncMock(return_value=_ok_response())
+
+    _holder: dict = {}
+    _token = _PRIMARY_CARD_HOLDER.set(_holder)
+    try:
+        r_a = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="hi from thread A",
+                reply_to="om_anchor_a",
+                metadata={"thread_id": "omt_thread_a"},
+            )
+        )
+        r_b = asyncio.run(
+            adapter.send(
+                chat_id="oc_chat",
+                content="hi from thread B",
+                reply_to="om_anchor_b",
+                metadata={"thread_id": "omt_thread_b"},
+            )
+        )
+    finally:
+        _PRIMARY_CARD_HOLDER.reset(_token)
+
+    # Two different cards (different thread ids = different holder keys)
+    assert r_a.message_id == "om_thread_a"
+    assert r_b.message_id == "om_thread_b"
+    assert _holder == {
+        ("oc_chat", "omt_thread_a"): "om_thread_a",
+        ("oc_chat", "omt_thread_b"): "om_thread_b",
+    }
+
+    # Both turns went through the create-card path; no cross-thread patch
+    assert adapter._feishu_send_with_retry.await_count == 2
+    adapter._patch_card_message.assert_not_called()
+
+
+def test_send_outside_of_run_agent_creates_fresh_card_each_time() -> None:
+    """When ``send()`` is called without any per-call holder (e.g. cron
+    delivery, CLI tools, ad-hoc notifications), the holder ContextVar's
+    default of ``None`` makes the lookup short-circuit and every call ships
+    a new card.  Guards the semantic that the holder is ONLY active inside
+    ``_run_agent``."""
+    from gateway.platforms.feishu import _PRIMARY_CARD_HOLDER
+
+    # Sanity-check: with no token set, the default is None.
+    assert _PRIMARY_CARD_HOLDER.get() is None
+
+    adapter = _make_adapter()
+    adapter._feishu_send_with_retry = AsyncMock(
+        side_effect=[
+            _ok_send_response("om_one"),
+            _ok_send_response("om_two"),
+        ]
+    )
+    adapter._patch_card_message = AsyncMock(return_value=_ok_response())
+
+    r1 = asyncio.run(
+        adapter.send(
+            chat_id="oc_chat",
+            content="first ad-hoc",
+            reply_to="om_anchor",
+            metadata={"thread_id": "omt_topic"},
+        )
+    )
+    r2 = asyncio.run(
+        adapter.send(
+            chat_id="oc_chat",
+            content="second ad-hoc",
+            reply_to="om_anchor",
+            metadata={"thread_id": "omt_topic"},
+        )
+    )
+
+    # Both calls created their own card; no patching happened
+    assert r1.message_id == "om_one"
+    assert r2.message_id == "om_two"
+    assert adapter._feishu_send_with_retry.await_count == 2
+    adapter._patch_card_message.assert_not_called()

@@ -29,11 +29,12 @@ import re
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -107,6 +108,33 @@ from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Per-call thread-reply primary card holder
+# ---------------------------------------------------------------------------
+# Maps (chat_id, thread_id) -> message_id of the live thread-reply card for
+# the current ``_run_agent`` call.  Used by ``send()`` to keep one card per
+# turn (segment breaks, commentary, and the final response all PATCH the
+# same card surface) without leaking state across queries.
+#
+# Lifetime: set to a fresh ``{}`` at the top of ``gateway.run._run_agent``
+# and reset in its ``finally`` block.  Default is ``None`` so callers
+# outside ``_run_agent`` (cron delivery, tests, CLI) see no holder and
+# always create a fresh card -- which is the correct semantic for those
+# code paths.
+#
+# Why a ContextVar (rather than an adapter instance attribute):
+# the previous adapter-level ``self._primary_card`` dict persisted across
+# every query in a long-running gateway, so the second message in a thread
+# patched the first message's card.  ContextVars are task-local in
+# asyncio (``asyncio.create_task`` copies the current Context), so every
+# task spawned inside ``_run_agent`` -- progress sender, stream consumer,
+# adapter sends made via ``run_coroutine_threadsafe`` -- inherits the
+# same per-call holder, while concurrent or subsequent calls each get
+# their own.
+_PRIMARY_CARD_HOLDER: ContextVar[Optional[Dict[Tuple[str, str], str]]] = ContextVar(
+    "_FEISHU_PRIMARY_CARD_HOLDER", default=None
+)
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -1202,15 +1230,11 @@ class FeishuAdapter(BasePlatformAdapter):
         # event loop.
         self._card_state: Dict[str, Dict[str, Any]] = {}
         self._card_state_lock = threading.Lock()
-        # Primary thread-reply card per (chat_id, thread_id) — only ONE card per
-        # turn.  Maps (chat_id, thread_id) → message_id of the live card surface.
-        # When send() is called for the same (chat_id, thread_id) that already has
-        # a live card, it patches that card instead of creating a new one — this is
-        # the mechanism that keeps streaming text, commentary, and final response on
-        # a single card rather than spawning a fresh one each time.
-        # Text output → _update_main_text (patch main_text only)
-        # Tool calls → append_tool_step (patch tool_steps only, separate code path)
-        self._primary_card: Dict = {}
+        # NOTE: the per-(chat_id, thread_id) primary card mapping lives in the
+        # module-level ``_PRIMARY_CARD_HOLDER`` ContextVar, not here.  See the
+        # ContextVar definition for lifetime and rationale.  We deliberately
+        # do NOT keep an instance attribute because that previously leaked the
+        # first query's card id into every later send() in the same thread.
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1503,11 +1527,22 @@ class FeishuAdapter(BasePlatformAdapter):
             # second card.  Instead patch the existing card's main_text so the
             # entire turn (thinking / intermediate text / final) stays on ONE card.
             # Text output → _update_main_text; tool calls → append_tool_step.
+            #
+            # The (chat_id, thread_id) → message_id mapping lives in a per-call
+            # ContextVar holder (_PRIMARY_CARD_HOLDER), NOT on the adapter
+            # instance, so subsequent queries in the same thread start with a
+            # fresh holder and create their own card.  When the holder is None
+            # (e.g. send() called outside _run_agent: cron delivery, tests),
+            # the lookup is skipped and we always create a fresh card.
             _primary_key = (chat_id, thread_id)
-            with self._card_state_lock:
-                _existing_id = self._primary_card.get(_primary_key)
-                _live = _existing_id is not None and _existing_id in self._card_state
-            if _live:
+            _primary_holder = _PRIMARY_CARD_HOLDER.get()
+            _existing_id: Optional[str] = None
+            if _primary_holder is not None:
+                with self._card_state_lock:
+                    _candidate = _primary_holder.get(_primary_key)
+                    if _candidate is not None and _candidate in self._card_state:
+                        _existing_id = _candidate
+            if _existing_id is not None:
                 _upd = await self._update_main_text(_existing_id, formatted)
                 if _upd.success:
                     return _upd
@@ -1550,8 +1585,11 @@ class FeishuAdapter(BasePlatformAdapter):
                             # Register as the primary card for this turn so
                             # subsequent send() calls (from stream consumer after
                             # segment breaks, or from commentary delivery) route
-                            # here instead of creating a new card.
-                            self._primary_card[_primary_key] = result.message_id
+                            # here instead of creating a new card.  The holder is
+                            # per-call (ContextVar set by gateway.run._run_agent),
+                            # so this assignment scopes to the current query only.
+                            if _primary_holder is not None:
+                                _primary_holder[_primary_key] = result.message_id
                     return result
                 logger.warning(
                     "[Feishu] Thread-reply card rejected (code=%s msg=%s); "

@@ -7792,6 +7792,21 @@ class GatewayRunner:
         # and the final response land on the same card surface.  Per-call
         # local state — never leaks between turns.
         _feishu_placeholder_card_id_holder: List[Optional[str]] = [None]
+
+        # Per-call (chat_id, thread_id) -> message_id holder for the Feishu
+        # one-card-per-turn behaviour.  Bound to a fresh dict for THIS
+        # ``_run_agent`` call via the module-level ``_PRIMARY_CARD_HOLDER``
+        # ContextVar.  asyncio task creation copies the current Context, so
+        # the progress sender / stream consumer / placeholder send all see
+        # the same holder, while subsequent queries (or concurrent ones)
+        # each get their own — fixing the bug where the second message in
+        # a thread patched the first message's card.
+        # Reset is performed in the ``finally`` block at the end of the
+        # main ``try`` (search ``_feishu_primary_card_holder_token`` below).
+        from gateway.platforms.feishu import (
+            _PRIMARY_CARD_HOLDER as _feishu_primary_card_holder_var,
+        )
+        _feishu_primary_card_holder_token = _feishu_primary_card_holder_var.set({})
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_event_loop()
@@ -8893,6 +8908,17 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
+
+            # Restore the per-call Feishu primary-card holder so the next
+            # ``_run_agent`` invocation in the same task starts with no
+            # leftover (chat_id, thread_id) -> message_id mapping.
+            try:
+                _feishu_primary_card_holder_var.reset(_feishu_primary_card_holder_token)
+            except Exception:
+                # ContextVar.reset only fails if the token was created in a
+                # different Context; that should never happen here, but
+                # never let cleanup mask the real exception.
+                pass
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
