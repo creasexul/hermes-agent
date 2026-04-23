@@ -104,8 +104,21 @@ def test_tool_steps_render_collapsible_panel_with_divs() -> None:
     assert len(divs) == 2
     assert divs[0]["text"]["content"] == "ls /"
     assert divs[1]["text"]["content"] == "a.py"
-    # Tool icon style matches what Mavis uses
-    assert divs[0]["icon"]["token"] == "tools_outlined"
+    # Tool calls (bash, read, etc.) use gear icon
+    assert divs[0]["icon"]["token"] == "setting-2_outlined"
+    assert divs[1]["icon"]["token"] == "setting-2_outlined"
+
+
+def test_tool_step_icon_splits_by_tool_type() -> None:
+    """Text/thinking steps use chat_outlined; tool calls use setting-2_outlined."""
+    from gateway.platforms.feishu import _tool_step_to_div
+
+    tool_div = _tool_step_to_div({"tool": "bash", "label": "run"})
+    assert tool_div["icon"]["token"] == "setting-2_outlined"
+
+    for text_tool in ("text", "message", "thinking", "reasoning", ""):
+        div = _tool_step_to_div({"tool": text_tool, "label": "msg"})
+        assert div["icon"]["token"] == "chat_outlined", f"failed for tool={text_tool!r}"
 
 
 def test_thinking_renders_expanded_collapsible_panel() -> None:
@@ -475,5 +488,103 @@ def test_stream_consumer_adopt_message_id_ignores_empty() -> None:
     assert consumer.already_sent is False
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(pytest.main([__file__, "-v"]))
+# ---------------------------------------------------------------------------
+# One-card-per-turn: send() routes subsequent calls to _update_main_text
+# ---------------------------------------------------------------------------
+
+
+def test_send_second_call_for_same_thread_patches_primary_card() -> None:
+    """When a live card already exists for (chat_id, thread_id), a second
+    send() patches it via _update_main_text instead of creating a new card."""
+    adapter = _make_adapter()
+    # Manually register a primary card (simulating the placeholder that was
+    # pre-sent by run.py before streaming started).
+    _register_card(adapter, "om_primary", main_text="…")
+    adapter._primary_card[("oc_chat", "omt_topic")] = "om_primary"
+    adapter._patch_card_message = AsyncMock(return_value=_ok_response())
+
+    result = asyncio.run(
+        adapter.send(
+            chat_id="oc_chat",
+            content="streaming update",
+            reply_to="om_anchor",
+            metadata={"thread_id": "omt_topic"},
+        )
+    )
+
+    # Must return the SAME primary card id — NOT a new one
+    assert result.success is True
+    assert result.message_id == "om_primary"
+
+    # _update_main_text must have patched the card (no new send to Feishu)
+    adapter._patch_card_message.assert_awaited_once()
+    card = _captured_card(adapter._patch_card_message)
+    assert card["body"]["elements"][0]["content"] == "streaming update"
+
+    # State was updated too
+    assert adapter._card_state["om_primary"]["main_text"] == "streaming update"
+
+
+def test_send_first_call_registers_primary_card() -> None:
+    """The very first send() for a (chat_id, thread_id) creates a new card
+    AND registers it as the primary so subsequent calls route to patch."""
+    adapter = _make_adapter()
+    adapter._feishu_send_with_retry = AsyncMock(
+        return_value=_ok_send_response("om_new_card")
+    )
+
+    asyncio.run(
+        adapter.send(
+            chat_id="oc_chat",
+            content="hello",
+            reply_to="om_anchor",
+            metadata={"thread_id": "omt_topic"},
+        )
+    )
+
+    assert adapter._primary_card.get(("oc_chat", "omt_topic")) == "om_new_card"
+
+
+def test_update_main_text_patches_with_current_tool_steps() -> None:
+    """``_update_main_text`` rebuilds the card including accumulated tool_steps."""
+    adapter = _make_adapter()
+    _register_card(adapter, "om_card_5", main_text="old text")
+    # Pre-populate tool steps
+    adapter._card_state["om_card_5"]["tool_steps"] = [
+        {"tool": "bash", "label": "step-a"},
+        {"tool": "read", "label": "step-b"},
+    ]
+    adapter._patch_card_message = AsyncMock(return_value=_ok_response())
+
+    result = asyncio.run(
+        adapter._update_main_text("om_card_5", "new text")
+    )
+
+    assert result.success is True
+    assert result.message_id == "om_card_5"
+
+    adapter._patch_card_message.assert_awaited_once()
+    card = _captured_card(adapter._patch_card_message)
+    # main_text updated
+    assert card["body"]["elements"][0]["content"] == "new text"
+    # tool_steps preserved in collapsible panel
+    panels = [e for e in card["body"]["elements"] if e.get("tag") == "collapsible_panel"]
+    assert len(panels) == 1
+    labels = [d["text"]["content"] for d in panels[0]["elements"] if d.get("tag") == "div"]
+    assert labels == ["step-a", "step-b"]
+
+
+def test_update_main_text_returns_success_even_on_patch_failure() -> None:
+    """Patch failures are non-fatal: _update_main_text still returns success=True
+    so the stream consumer does not enter fallback mode."""
+    adapter = _make_adapter()
+    _register_card(adapter, "om_card_6", main_text="old")
+    adapter._patch_card_message = AsyncMock(side_effect=RuntimeError("network error"))
+
+    result = asyncio.run(adapter._update_main_text("om_card_6", "new"))
+
+    # Always success so the consumer stays anchored to this card
+    assert result.success is True
+    assert result.message_id == "om_card_6"
+    # State still updated (next patch will re-apply)
+    assert adapter._card_state["om_card_6"]["main_text"] == "new"

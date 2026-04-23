@@ -3190,9 +3190,13 @@ class GatewayRunner:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
                             pass
+                        _thread_meta = (
+                            {"thread_id": event.source.thread_id}
+                            if event.source.thread_id else None
+                        )
                         await adapter.send(
                             source.chat_id, notice,
-                            metadata=getattr(event, 'metadata', None),
+                            metadata=_thread_meta,
                         )
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
@@ -7589,19 +7593,27 @@ class GatewayRunner:
             def _active_feishu_card_id() -> Optional[str]:
                 if not _is_feishu_card_path:
                     return None
+                _state = getattr(adapter, "_card_state", {}) or {}
+                # Prefer THIS query's placeholder card id (per-call local
+                # state) so early tool fires — before the stream consumer
+                # publishes _message_id — land on the current turn's card,
+                # not whatever the previous turn left at the end of the
+                # adapter-global _card_state dict.  We previously used
+                # ``next(reversed(_card_state))`` here, which leaks across
+                # queries because _card_state accumulates indefinitely on
+                # the adapter instance.
+                _ph = _feishu_placeholder_card_id_holder[0]
+                if _ph and _ph in _state:
+                    return str(_ph)
+                # Next, follow the stream consumer's current message id —
+                # the adapter may have rotated to a fresh id mid-stream
+                # (e.g. patch fallback in _edit_thread_reply_card); the
+                # consumer keeps it in sync via adopt_message_id and the
+                # edit_message return value.
                 _sc = stream_consumer_holder[0]
                 _mid = getattr(_sc, "_message_id", None) if _sc else None
-                if _mid and _mid != "__no_edit__":
-                    _state = getattr(adapter, "_card_state", {}) or {}
-                    if _mid in _state:
-                        return str(_mid)
-                # Fall back: any tracked thread-reply card on the adapter
-                # (e.g. final response shipped before stream consumer
-                # populated _message_id).  Use the most-recently inserted
-                # entry — Python dicts preserve insertion order.
-                _state = getattr(adapter, "_card_state", {}) or {}
-                if _state:
-                    return next(reversed(_state))
+                if _mid and _mid != "__no_edit__" and _mid in _state:
+                    return str(_mid)
                 return None
 
             progress_lines = []      # Accumulated tool lines

@@ -80,6 +80,7 @@ class GatewayStreamConsumer:
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
         self._message_id: Optional[str] = None
+        self._pinned_message_id: Optional[str] = None
         self._already_sent = False
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
@@ -112,6 +113,7 @@ class GatewayStreamConsumer:
         if not message_id:
             return
         self._message_id = str(message_id)
+        self._pinned_message_id = str(message_id)
         self._already_sent = True
 
     def on_segment_break(self) -> None:
@@ -126,7 +128,9 @@ class GatewayStreamConsumer:
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
-        self._message_id = None
+        # Restore pinned message_id (adopted placeholder card) so post-tool
+        # final delta still EDITs the same card instead of sending a new one.
+        self._message_id = self._pinned_message_id
         self._accumulated = ""
         self._last_sent_text = ""
         self._fallback_final_send = False

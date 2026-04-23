@@ -451,12 +451,12 @@ def _make_collapsible_panel(
             "title": {"tag": "plain_text", "content": label},
             "vertical_align": "center",
             "padding": "4px 0px 4px 8px",
-            "icon": {
-                "tag": "standard_icon",
-                "token": "down-small-ccm_outlined",
-                "color": "grey",
-                "size": "16px 16px",
-            },
+            # Intentionally no custom ``icon`` — the previous
+            # ``down-small_outlined`` / ``down-small-ccm_outlined`` tokens
+            # were guesses that rendered as blank squares in the Feishu
+            # client.  Omitting the field lets Feishu render its native
+            # default chevron, which rotates correctly via
+            # ``icon_expanded_angle``.
             "icon_position": "right",
             "icon_expanded_angle": 180,
         },
@@ -468,15 +468,20 @@ def _make_collapsible_panel(
 
 
 def _tool_step_to_div(step: Dict[str, Any]) -> Dict[str, Any]:
-    """Render one tool step ({tool, label}) as a Feishu ``div`` element."""
+    """Render one tool step ({tool, label}) as a Feishu ``div`` element.
+
+    The label already carries the tool's own emoji (from ``tools/registry``,
+    e.g. ``🔍 session_search: ...``), so we render plain text without any
+    ``standard_icon`` — the previous ``setting-2_outlined`` /
+    ``chat_outlined`` tokens were rendering as blank squares in the Feishu
+    client.  Plain text is sufficient because the Unicode emoji glyph at
+    the start of the label takes the leftmost position naturally; using
+    ``lark_md`` would invite accidental markdown parsing of characters
+    like ``:`` / ``*`` / backticks inside tool labels.
+    """
     label = str(step.get("label", "") or "")
     return {
         "tag": "div",
-        "icon": {
-            "tag": "standard_icon",
-            "token": "tools_outlined",
-            "color": "grey",
-        },
         "text": {"tag": "plain_text", "content": label},
     }
 
@@ -1197,6 +1202,15 @@ class FeishuAdapter(BasePlatformAdapter):
         # event loop.
         self._card_state: Dict[str, Dict[str, Any]] = {}
         self._card_state_lock = threading.Lock()
+        # Primary thread-reply card per (chat_id, thread_id) — only ONE card per
+        # turn.  Maps (chat_id, thread_id) → message_id of the live card surface.
+        # When send() is called for the same (chat_id, thread_id) that already has
+        # a live card, it patches that card instead of creating a new one — this is
+        # the mechanism that keeps streaming text, commentary, and final response on
+        # a single card rather than spawning a fresh one each time.
+        # Text output → _update_main_text (patch main_text only)
+        # Tool calls → append_tool_step (patch tool_steps only, separate code path)
+        self._primary_card: Dict = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1482,6 +1496,25 @@ class FeishuAdapter(BasePlatformAdapter):
             and formatted
             and not formatted.lstrip().startswith("/")
         ):
+            # ── One-card-per-turn: route to existing card if one is live ──
+            # When a placeholder (or earlier text delta) already created a card
+            # for this (chat_id, thread_id) pair, stream consumer tool boundaries
+            # reset _message_id=None and call send() again — we must NOT create a
+            # second card.  Instead patch the existing card's main_text so the
+            # entire turn (thinking / intermediate text / final) stays on ONE card.
+            # Text output → _update_main_text; tool calls → append_tool_step.
+            _primary_key = (chat_id, thread_id)
+            with self._card_state_lock:
+                _existing_id = self._primary_card.get(_primary_key)
+                _live = _existing_id is not None and _existing_id in self._card_state
+            if _live:
+                _upd = await self._update_main_text(_existing_id, formatted)
+                if _upd.success:
+                    return _upd
+                # Card was evicted between the liveness check and the patch
+                # (race with _edit_thread_reply_card fallback) — fall through
+                # to create a fresh card.
+
             try:
                 card = _build_thread_reply_card(main_text=formatted)
                 card_payload = json.dumps(card, ensure_ascii=False)
@@ -1502,9 +1535,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         # TODO: bound _card_messages / _card_state growth.
                         # Today entries are only evicted on patch failure
                         # (_edit_thread_reply_card).  Long-running gateways
-                        # accumulate one entry per thread-reply card sent,
-                        # made worse by the per-turn placeholder card pre-sent
-                        # from gateway/run.py.  Add an LRU cap or a TTL sweep.
+                        # accumulate one entry per thread-reply card sent.
+                        # Add an LRU cap or a TTL sweep.
                         with self._card_state_lock:
                             self._card_messages[result.message_id] = {
                                 "chat_id": chat_id,
@@ -1515,6 +1547,11 @@ class FeishuAdapter(BasePlatformAdapter):
                                 "main_text": formatted,
                                 "tool_steps": [],
                             }
+                            # Register as the primary card for this turn so
+                            # subsequent send() calls (from stream consumer after
+                            # segment breaks, or from commentary delivery) route
+                            # here instead of creating a new card.
+                            self._primary_card[_primary_key] = result.message_id
                     return result
                 logger.warning(
                     "[Feishu] Thread-reply card rejected (code=%s msg=%s); "
@@ -1782,6 +1819,54 @@ class FeishuAdapter(BasePlatformAdapter):
                 exc,
             )
             return SendResult(success=False, message_id=message_id, error=str(exc))
+
+    async def _update_main_text(self, message_id: str, formatted_text: str) -> SendResult:
+        """Patch the main text of a tracked thread-reply card without touching tool_steps.
+
+        This is the single-card mechanism: when send() detects that a live card
+        already exists for (chat_id, thread_id), it calls here instead of creating
+        a new card.  Streaming text deltas, interim commentary, and the final
+        response all flow through this path — keeping ONE card per turn.
+
+        Tool call steps are added via append_tool_step(), a separate code path
+        that only modifies tool_steps without touching main_text.
+
+        Patch failures are non-fatal and always return success=True: the state
+        is updated before the patch so the next delta will re-apply the correct
+        text; the stream consumer must not be driven into fallback mode by a
+        transient Feishu API hiccup.
+        """
+        with self._card_state_lock:
+            state = self._card_state.get(message_id)
+            if state is None:
+                # Card evicted (e.g. by a previous patch failure fallback) —
+                # signal the caller to fall through to normal send().
+                return SendResult(success=False, message_id=message_id, error="unknown card")
+            state["main_text"] = formatted_text
+            tool_steps = list(state.get("tool_steps") or [])
+        try:
+            card = _build_thread_reply_card(
+                main_text=formatted_text,
+                tool_steps=tool_steps or None,
+            )
+            response = await self._patch_card_message(message_id, card)
+            if not self._response_succeeded(response):
+                logger.debug(
+                    "[Feishu] _update_main_text patch rejected (id=%s code=%s); "
+                    "state updated, will retry on next delta",
+                    message_id,
+                    getattr(response, "code", "?"),
+                )
+        except Exception as exc:
+            logger.debug(
+                "[Feishu] _update_main_text patch failed for %s: %s; "
+                "state updated, will retry on next delta",
+                message_id,
+                exc,
+            )
+        # Always return the primary card's id so the stream consumer stays
+        # anchored to the same surface and does not enter fallback mode.
+        return SendResult(success=True, message_id=message_id)
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
