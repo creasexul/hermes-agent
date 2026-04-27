@@ -7805,8 +7805,29 @@ class GatewayRunner:
         # main ``try`` (search ``_feishu_primary_card_holder_token`` below).
         from gateway.platforms.feishu import (
             _PRIMARY_CARD_HOLDER as _feishu_primary_card_holder_var,
+            _MENTION_TARGET_HOLDER as _feishu_mention_target_var,
+            _prepend_feishu_mention as _feishu_prepend_mention,
         )
         _feishu_primary_card_holder_token = _feishu_primary_card_holder_var.set({})
+
+        # Per-call Feishu @-mention target.  Set to the inbound sender's
+        # open_id so the FINAL response edit can prepend ``<at id=...></at>``
+        # to the card body.  Cron deliveries / synthetic events with no
+        # sender leave this None, so the prepend helper is a no-op there.
+        # Restricted to thread-reply (``_progress_thread_id`` is set) so
+        # text-only sends (which don't go through the card path at all)
+        # are unaffected.  Reset in the ``finally`` block alongside the
+        # primary-card holder.
+        _feishu_mention_open_id: Optional[str] = None
+        if (
+            source.platform == Platform.FEISHU
+            and _progress_thread_id
+            and getattr(source, "user_id", None)
+        ):
+            _feishu_mention_open_id = str(source.user_id)
+        _feishu_mention_target_token = _feishu_mention_target_var.set(
+            _feishu_mention_open_id
+        )
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_event_loop()
@@ -8822,10 +8843,17 @@ class GatewayRunner:
                         _sent_via_placeholder = False
                         if _ph_id:
                             try:
+                                # Final write to the card body — prepend the
+                                # per-call @-mention so the user is pinged
+                                # exactly once on the response (helper is a
+                                # no-op when no sender / non-Feishu / cron).
+                                _first_with_mention = _feishu_prepend_mention(
+                                    first_response
+                                )
                                 _ph_edit = await adapter.edit_message(
                                     chat_id=source.chat_id,
                                     message_id=_ph_id,
-                                    content=first_response,
+                                    content=_first_with_mention,
                                 )
                                 _sent_via_placeholder = bool(
                                     getattr(_ph_edit, "success", False)
@@ -8838,9 +8866,16 @@ class GatewayRunner:
                                 )
                         if not _sent_via_placeholder:
                             try:
+                                # Same mention-prepend semantics for the
+                                # fallback fresh-card path.  When this code
+                                # runs outside a Feishu thread reply, the
+                                # helper returns first_response unchanged.
+                                _first_with_mention = _feishu_prepend_mention(
+                                    first_response
+                                )
                                 await adapter.send(
                                     source.chat_id,
-                                    first_response,
+                                    _first_with_mention,
                                     metadata=_status_thread_metadata,
                                 )
                             except Exception as e:
@@ -8920,6 +8955,15 @@ class GatewayRunner:
                 # never let cleanup mask the real exception.
                 pass
 
+            # Same lifetime as the primary-card holder: clear the per-call
+            # @-mention target so the next query (or any post-_run_agent
+            # send) does NOT spuriously inject this query's sender into
+            # someone else's card.
+            try:
+                _feishu_mention_target_var.reset(_feishu_mention_target_token)
+            except Exception:
+                pass
+
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
         # BUT: never suppress delivery when the agent failed — the error
@@ -8956,11 +9000,27 @@ class GatewayRunner:
             _placeholder_adapter = self.adapters.get(source.platform)
             _final_text = response.get("final_response") or ""
             if _placeholder_adapter is not None and _final_text:
+                # FINAL response write: prepend the per-call @-mention so
+                # the sender is pinged exactly once on the answer.  We
+                # MUST pass ``open_id`` explicitly here — this branch
+                # runs AFTER the ``finally`` block has already reset
+                # ``_MENTION_TARGET_HOLDER`` back to None, so the helper
+                # would otherwise see no target and silently drop the
+                # mention.  ``_feishu_mention_open_id`` is the local
+                # captured before the try block (None for cron / no
+                # sender / non-thread sources), so the helper still
+                # degrades to a no-op when appropriate.  Intermediate
+                # stream deltas, tool-step patches, and the placeholder
+                # itself never go through this branch, so they remain
+                # @-free.
+                _final_text_with_mention = _feishu_prepend_mention(
+                    _final_text, open_id=_feishu_mention_open_id
+                )
                 try:
                     _edit_result = await _placeholder_adapter.edit_message(
                         chat_id=source.chat_id,
                         message_id=_placeholder_card_id,
-                        content=_final_text,
+                        content=_final_text_with_mention,
                     )
                     if getattr(_edit_result, "success", False):
                         response["already_sent"] = True

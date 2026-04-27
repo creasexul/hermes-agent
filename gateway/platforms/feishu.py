@@ -137,6 +137,29 @@ _PRIMARY_CARD_HOLDER: ContextVar[Optional[Dict[Tuple[str, str], str]]] = Context
 )
 
 # ---------------------------------------------------------------------------
+# Per-query @-mention target for the FINAL response card body
+# ---------------------------------------------------------------------------
+# Holds the inbound sender's open_id so the final-response write to the
+# thread-reply card can prepend ``<at id=open_id></at>`` to the markdown
+# body.  Set by ``gateway.run._run_agent`` at entry (only when the platform
+# is Feishu, the message is a thread reply, and a sender is known) and
+# reset in its ``finally`` block.  Default is ``None`` so callers outside
+# ``_run_agent`` (cron delivery, CLI, ad-hoc sends) and synthetic events
+# without a sender naturally degrade to "no @" without raising.
+#
+# Why ContextVar (vs. an adapter instance attribute or a send() kwarg):
+# - Adapter instance attributes leak across queries (see _PRIMARY_CARD_HOLDER
+#   for the same lesson).
+# - Adding a kwarg to send/edit_message would touch every adapter and every
+#   caller; the ContextVar is invisible to non-Feishu paths.
+# Reads happen at the call site (gateway/run.py) right before the FINAL
+# edit_message — NOT inside the adapter's edit/patch path — so streaming
+# intermediate edits and tool-step patches naturally do not pick up the @.
+_MENTION_TARGET_HOLDER: ContextVar[Optional[str]] = ContextVar(
+    "_FEISHU_MENTION_TARGET", default=None
+)
+
+# ---------------------------------------------------------------------------
 # Regex patterns
 # ---------------------------------------------------------------------------
 
@@ -512,6 +535,36 @@ def _tool_step_to_div(step: Dict[str, Any]) -> Dict[str, Any]:
         "tag": "div",
         "text": {"tag": "plain_text", "content": label},
     }
+
+
+def _format_feishu_at_mention(open_id: str) -> str:
+    """Return the Feishu V2 markdown ``<at>`` syntax for ``open_id``.
+
+    The ``<at id=...>`` element only renders as a real @-mention when it
+    appears inside a card element with tag ``markdown`` (or ``lark_md``);
+    plain_text elements show the raw tag instead.
+    """
+    return f"<at id={open_id}></at>"
+
+
+def _prepend_feishu_mention(text: str, open_id: Optional[str] = None) -> str:
+    """Prepend a Feishu @-mention to *text* using *open_id*.
+
+    If *open_id* is None, falls back to the per-call
+    ``_MENTION_TARGET_HOLDER`` ContextVar (set by
+    ``gateway.run._run_agent``).  When neither resolves to a non-empty
+    open_id — e.g. cron delivery, CLI sends, or synthetic events with no
+    sender — *text* is returned unchanged so the call site can use this
+    helper unconditionally.
+
+    The result is intended for the ``markdown`` body element of a
+    thread-reply card; embedding it in plain_text leaves the raw tag
+    visible.
+    """
+    resolved = open_id if open_id is not None else _MENTION_TARGET_HOLDER.get()
+    if not resolved or not text:
+        return text
+    return f"{_format_feishu_at_mention(resolved)}\n\n{text}"
 
 
 def _build_thread_reply_card(
